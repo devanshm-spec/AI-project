@@ -26,13 +26,17 @@ Files written to --out-dir (open the PNGs afterwards)
     06_headline_<set>.png              main heuristic, with / without guidance, vs plain A*   (bars)
     07_all_combinations_<set>.png      heatmaps of every heuristic x guidance combination
     08_distributions_<set>.png         per-map boxplots + scatter against plain A*
-    09_search_examples_<set>.png       open / closed / path pictures: plain A* vs stochastic A* variants
+    09_search_examples_<set>.png       per map: plain A* + stochastic A* with EVERY guidance source (constant and each learned
+                                       model, labelled in-distribution / OOD), and below it Neural A* with the same sources
+                                       (Neural A* pictures show closed cells + path; its open set is not returned)
     10_neural_astar_cross_eval.png     the three guidance models (and constant Phi) on all test sets, paper metrics (optional)
     results.csv / results.json / results_per_map.json / summary.txt / compare_log.txt
 
 Kaggle notebook:
-    !python compare_all.py                                   # defaults: ROOT=/kaggle/working, rect test set, 100 maps
-    !python compare_all.py --eval-sets rect,maze,noise --n 100
+    !python compare_all.py                                   # defaults: ROOT=/kaggle/working, all three test sets, 100 maps,
+                                                             # Neural A* rows added automatically when a GPU is available
+    !python compare_all.py --neural on --n 100               # force the Neural A* rows (slow on CPU)
+    !python compare_all.py --main-heuristic matched          # headline figures: CNN trained on the style of each test set
     !python compare_all.py --reuse-results                   # only redraw the bar / heatmap / box figures
 """
 import argparse
@@ -61,9 +65,10 @@ from matplotlib.patches import Patch
 
 from make_synthetic_data import bfs_dist
 from stochastic_astar import (COL, CNNHeuristics, CheckpointGuidance, ConstGuidance, MinkowskiHeuristics,
-                              load_npz, plain_astar, result_to_rgb, stochastic_astar, validate_path)
+                              SearchResult, load_npz, plain_astar, result_to_rgb, stochastic_astar, validate_path)
 
 NAMES = ["rect", "maze", "noise"]
+NEURAL = "neural"          # key of the Neural A* rows (Chebyshev heuristic, differentiable search)
 STYLE_COLOR = {"rect": "tab:blue", "maze": "tab:green", "noise": "tab:red"}
 _LOG = None
 
@@ -80,6 +85,8 @@ def log(*a):
 # labels / colours
 # --------------------------------------------------------------------------------------
 def hlabel(k):
+    if k == NEURAL:
+        return "Neural A*\n(Chebyshev h)"
     if k == "minkowski":
         return "Minkowski mean\n(no training)"
     return f"CNN heuristic\n(trained on {k[4:]})"
@@ -160,9 +167,86 @@ def is_phi_free(hu):
 
 
 # --------------------------------------------------------------------------------------
+# Neural A* (differentiable search of neural_astar.py) with the same guidance sources
+# --------------------------------------------------------------------------------------
+def build_neural_models(guides, device):
+    """guidance key -> NeuralAStar. Constant Phi: ConstPhi encoder. Learned: the model of the checkpoint (shared with
+    the guidance source) with the Chebyshev heuristic. Needs torch."""
+    from neural_astar import ConstPhi, NeuralAStar
+    models = OrderedDict()
+    for gk, gd in guides.items():
+        if isinstance(gd, ConstGuidance):
+            m = NeuralAStar(encoder=ConstPhi(gd.c)).to(device)
+            m.set_constant_guidance(gd.c)
+        elif hasattr(gd, "model"):
+            m = gd.model
+            m.use_chebyshev()
+        else:
+            continue
+        m.eval()
+        models[gk] = m
+    return models
+
+
+def neural_search(model, maps, starts, goals, idx, device):
+    """Run the differentiable A* on maps[i] for i in idx as one batch -> AStarOutput (on `device`)."""
+    import torch
+    H, W = maps[idx[0]].shape
+    m = torch.zeros(len(idx), 1, H, W)
+    s = torch.zeros(len(idx), 1, H, W)
+    g = torch.zeros(len(idx), 1, H, W)
+    for b, i in enumerate(idx):
+        m[b, 0] = torch.from_numpy(np.asarray(maps[i], np.float32))
+        s[b, 0, starts[i][0], starts[i][1]] = 1.0
+        g[b, 0, goals[i][0], goals[i][1]] = 1.0
+    with torch.no_grad():
+        out, _ = model(m.to(device), s.to(device), g.to(device))
+    return out
+
+
+def neural_example(model, free, s, g, device):
+    """One Neural A* search as a SearchResult for the pictures: the closed list and the path are known, the open set
+    is not returned by the differentiable search (left empty)."""
+    out = neural_search(model, [free], [s], [g], [0], device)
+    closed = out.histories[0, 0].cpu().numpy() > 0.5
+    path = out.paths[0, 0].cpu().numpy() > 0.5
+    found = bool(out.found[0])
+    return SearchResult(found, [tuple(int(x) for x in p) for p in np.argwhere(path)], closed,
+                        np.zeros_like(closed), 0)
+
+
+def evaluate_neural(models, ts, n, device, bs=16):
+    """-> {guidance key: per-map record in the same format as the stochastic runs}. Expanded nodes include the goal
+    (as plain A* counts it); the path validity is not checked (the path comes back as an unordered mask)."""
+    maps, starts, goals = ts["maps"], ts["starts"], ts["goals"]
+    recs = OrderedDict()
+    for gk, model in models.items():
+        rec = {k: [] for k in ("found", "closed", "open", "iters", "meanK", "len", "valid", "sec")}
+        for b0 in range(0, n, bs):
+            idx = list(range(b0, min(n, b0 + bs)))
+            t1 = time.time()
+            out = neural_search(model, maps, starts, goals, idx, device)
+            sec = (time.time() - t1) / len(idx)
+            closed = out.histories.flatten(1).sum(1).cpu().numpy()
+            plen = out.paths.flatten(1).sum(1).cpu().numpy()
+            found = out.found.cpu().numpy()
+            for j in range(len(idx)):
+                rec["found"].append(bool(found[j]))
+                rec["closed"].append(int(round(float(closed[j]))) + int(found[j]))
+                rec["open"].append(0)
+                rec["iters"].append(rec["closed"][-1])
+                rec["meanK"].append(0.0)
+                rec["len"].append(int(round(float(plen[j]))) if found[j] else 0)
+                rec["valid"].append(True)
+                rec["sec"].append(sec)
+        recs[gk] = rec
+    return recs
+
+
+# --------------------------------------------------------------------------------------
 # evaluation
 # --------------------------------------------------------------------------------------
-def evaluate_set(name, ts, heurs, guides, kw, seed, n):
+def evaluate_set(name, ts, heurs, guides, kw, seed, n, neural_models=None, device="cpu"):
     maps, starts, goals = ts["maps"], ts["starts"], ts["goals"]
     n = min(n, len(maps)) if n else len(maps)
     lengths = np.asarray(ts["lengths"][:n], float)
@@ -202,6 +286,13 @@ def evaluate_set(name, ts, heurs, guides, kw, seed, n):
             log(f"  {one_line(hlabel(hk)):38s} | {one_line(glabel(gk)):28s} found {a['found']:5.1f}% | Opt {a['opt']:5.1f}% | "
                 f"len/opt {a['len_ratio']:.3f} | closed {a['closed']:7.1f} ({a['closed_vs_astar'] * 100:5.1f}% of A*) | "
                 f"Exp {a['exp']:5.1f}% | {a['sec']:.2f}s/map" + (f" | !! {a['invalid']} invalid paths" if a["invalid"] else ""))
+    if neural_models:
+        for gk, rec in evaluate_neural(neural_models, ts, n, device).items():
+            out["runs"][f"{NEURAL}|{gk}"] = rec
+            a = agg_run(rec, ref_closed, lengths)
+            log(f"  {one_line(hlabel(NEURAL)):38s} | {one_line(glabel(gk)):28s} found {a['found']:5.1f}% | Opt {a['opt']:5.1f}% | "
+                f"len/opt {a['len_ratio']:.3f} | closed {a['closed']:7.1f} ({a['closed_vs_astar'] * 100:5.1f}% of A*) | "
+                f"Exp {a['exp']:5.1f}% | {a['sec']:.2f}s/map")
     return out
 
 
@@ -258,10 +349,12 @@ def write_tables(results, out_dir):
         add("plain A* (Chebyshev)", "-", ref)
         for k, a in A.items():
             hk, gk = k.split("|")
-            add("stochastic | " + one_line(hlabel(hk)), one_line(glabel(gk)), a)
+            add("Neural A* | Chebyshev heuristic" if hk == NEURAL else "stochastic | " + one_line(hlabel(hk)),
+                one_line(glabel(gk)), a)
     lines.append("\nfound%: runs reaching the goal | Opt%: path not longer than the dataset's shortest path | len/opt: mean path "
                  "length / shortest | closed: expanded nodes | vs A*: closed / plain-A* closed | Exp%: mean per-map reduction of "
-                 "expanded nodes vs plain A* (floored at 0)")
+                 "expanded nodes vs plain A* (floored at 0) | Neural A*: differentiable search, expanded nodes include the goal, "
+                 "path validity is not checked")
     text = "\n".join(lines)
     with open(os.path.join(out_dir, "summary.txt"), "w") as f:
         f.write(text + "\n")
@@ -486,29 +579,63 @@ def bar_panel(ax, labels, vals, errs, colors, title, ref=None, ref_label="plain 
     ax.grid(axis="y", alpha=0.3)
 
 
+def grouped_bar_panel(ax, labels, series, title, ref=None, ref_label="plain A*", fmt="{:.1f}"):
+    """series: list of (name, values, errors or None, colours, hatch). One group of bars per label."""
+    x = np.arange(len(labels))
+    k = len(series)
+    w = 0.8 / k
+    for si, (name, vals, errs, cols, hatch) in enumerate(series):
+        xs = x + (si - (k - 1) / 2) * w
+        ax.bar(xs, vals, w, yerr=errs, color=cols, hatch=hatch, capsize=3, edgecolor="0.25", linewidth=0.6)
+        for xi, v in zip(xs, vals):
+            if np.isfinite(v):
+                ax.text(xi, v, fmt.format(v), ha="center", va="bottom", fontsize=7)
+    if ref is not None:
+        ax.axhline(ref, color="k", ls="--", lw=1.2)
+        ax.text(0.995, ref, f"{ref_label} {fmt.format(ref)}", transform=ax.get_yaxis_transform(), fontsize=7,
+                va="bottom", ha="right", bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1.0))
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_title(title, fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+
+
 def fig_headline(res, ref, A, main_h, path):
-    keys = [k for k in A if k.split("|")[0] == main_h]
-    if not keys:
+    gks = [k.split("|")[1] for k in A if k.split("|")[0] == main_h]
+    if not gks:
         raise RuntimeError(f"no runs for heuristic '{main_h}'")
-    gks = [k.split("|")[1] for k in keys]
     labels = [glabel(g) for g in gks]
     cols = [gcolor(g) for g in gks]
-    get = lambda m: [A[k][m] for k in keys]                            # noqa: E731
-    fig, ax = plt.subplots(1, 4, figsize=(19, 4.8))
-    bar_panel(ax[0], labels, get("closed"), get("closed_sem"), cols, "expanded (closed) nodes   (lower = faster)",
-              ref["closed"])
-    bar_panel(ax[1], labels, get("exp"), None, cols, "Exp %: node reduction vs plain A*   (higher = better)")
-    bar_panel(ax[2], labels, get("opt"), None, cols, "Opt %: path as short as the shortest path", ref["opt"])
-    bar_panel(ax[3], labels, get("len_ratio"), get("len_ratio_sem"), cols, "path length / shortest   (1 = optimal)",
-              ref["len_ratio"], fmt="{:.3f}")
-    lr = [v for v in get("len_ratio") + [ref["len_ratio"]] if np.isfinite(v)]
+    nan = float("nan")
+
+    def get(kind, m):
+        return [A[f"{kind}|{g}"][m] if f"{kind}|{g}" in A else nan for g in gks]
+
+    kinds = [(main_h, f"stochastic A* ({one_line(hlabel(main_h))})", "")]
+    if any(f"{NEURAL}|{g}" in A for g in gks):
+        kinds.append((NEURAL, "Neural A* (Chebyshev h)", "//"))
+
+    def series(m, err=None):
+        return [(nm, get(kd, m), get(kd, err) if err else None, cols, hatch) for kd, nm, hatch in kinds]
+
+    fig, ax = plt.subplots(1, 4, figsize=(21, 5.0))
+    grouped_bar_panel(ax[0], labels, series("closed", "closed_sem"), "expanded (closed) nodes   (lower = faster)", ref["closed"])
+    grouped_bar_panel(ax[1], labels, series("exp"), "Exp %: node reduction vs plain A*   (higher = better)")
+    grouped_bar_panel(ax[2], labels, series("opt"), "Opt %: path as short as the shortest path", ref["opt"])
+    grouped_bar_panel(ax[3], labels, series("len_ratio", "len_ratio_sem"), "path length / shortest   (1 = optimal)",
+                      ref["len_ratio"], fmt="{:.3f}")
+    lr = [v for kd, _, _ in kinds for v in get(kd, "len_ratio") + [ref["len_ratio"]] if np.isfinite(v)]
     if lr:
         ax[3].set_ylim(min(0.98, min(lr) - 0.02), max(lr) + 0.1)
-    fails = [(glabel(g).replace("\n", " "), A[k]["found"]) for k, g in zip(keys, gks) if A[k]["found"] < 99.99]
+    fails = [(f"{nm.split(' (')[0]} / {glabel(g).replace(chr(10), ' ')}", A[f"{kd}|{g}"]["found"])
+             for kd, nm, _ in kinds for g in gks if f"{kd}|{g}" in A and A[f"{kd}|{g}"]["found"] < 99.99]
     sub = ("   |   goal not reached in: " + ", ".join(f"{n} ({f:.0f}% found)" for n, f in fails)) if fails else ""
-    fig.suptitle(f"test set '{res['set']}' ({res['n']} maps): stochastic A* with {one_line(hlabel(main_h))} vs plain A*" + sub,
-                 fontsize=11)
-    fig.tight_layout()
+    fig.suptitle(f"test set '{res['set']}' ({res['n']} maps): stochastic A* with {one_line(hlabel(main_h))} and Neural A* "
+                 f"vs plain A*" + sub, fontsize=11)
+    handles = [Patch(facecolor="0.8", edgecolor="0.25", hatch=hatch, label=nm) for _, nm, hatch in kinds]
+    handles.append(plt.Line2D([0], [0], color="k", ls="--", label="plain A* (dashed line, value written next to it)"))
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
     fig.savefig(path, dpi=115)
     plt.close(fig)
 
@@ -535,7 +662,7 @@ def fig_matrix(res, ref, A, path):
         ax.set_yticklabels([hlabel(h) for h in hks], fontsize=7)
         ax.set_title(f"{t}\nplain A*: {fmt.format(ref[m])}", fontsize=9)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
-    fig.suptitle(f"test set '{res['set']}' ({res['n']} maps): stochastic A*, rows = heuristic, columns = guidance map", fontsize=11)
+    fig.suptitle(f"test set '{res['set']}' ({res['n']} maps): stochastic A* and Neural A*, rows = search / heuristic, columns = guidance map", fontsize=11)
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
@@ -547,69 +674,108 @@ def fig_distributions(res, A, main_h, path):
         raise RuntimeError(f"no runs for heuristic '{main_h}'")
     ref_closed = np.array(res["ref"]["closed"], float)
     lengths = np.array(res["lengths"], float)
-    labels = ["plain A*"] + [glabel(k.split("|")[1]) for k in keys]
-    cols = ["k"] + [gcolor(k.split("|")[1]) for k in keys]
-    closed = [ref_closed] + [np.array(res["runs"][k]["closed"], float) for k in keys]
-    ratios = [np.array(res["ref"]["len"], float) / lengths]
+    # entries: (run key, kind, guidance key) in the order  plain A*, then per guidance: stochastic, Neural A*
+    entries = []
     for k in keys:
+        gk = k.split("|")[1]
+        entries.append((k, "stochastic", gk))
+        if f"{NEURAL}|{gk}" in A:
+            entries.append((f"{NEURAL}|{gk}", "Neural A*", gk))
+    labels = ["plain A*"] + [f"{glabel(gk)}\n{kind}" for _, kind, gk in entries]
+    cols = ["k"] + [gcolor(gk) for _, _, gk in entries]
+    closed = [ref_closed] + [np.array(res["runs"][k]["closed"], float) for k, _, _ in entries]
+    ratios = [np.array(res["ref"]["len"], float) / lengths]
+    for k, _, _ in entries:
         f = np.array(res["runs"][k]["found"], bool)
         ratios.append((np.array(res["runs"][k]["len"], float) / lengths)[f])
-    fig, ax = plt.subplots(1, 3, figsize=(19, 5.2))
+    fig, ax = plt.subplots(1, 3, figsize=(max(19, 1.0 * len(labels) + 9), 5.4))
     for a, data, t in ((ax[0], closed, "expanded nodes per map"), (ax[2], ratios, "path length / shortest (found runs)")):
         bp = a.boxplot(data, patch_artist=True, showmeans=True)
-        for patch, c in zip(bp["boxes"], cols):
+        for patch, c, (_, kind, _) in zip(bp["boxes"], cols, [(None, "plain", None)] + entries):
             patch.set_facecolor(c)
             patch.set_alpha(0.5)
-        a.set_xticklabels(labels, fontsize=7)
+            if kind == "Neural A*":
+                patch.set_hatch("//")
+        a.set_xticklabels(labels, fontsize=6)
         a.set_title(t, fontsize=10)
         a.grid(axis="y", alpha=0.3)
-    for k, c in zip(keys, cols[1:]):
-        ax[1].scatter(ref_closed, res["runs"][k]["closed"], s=12, alpha=0.6, color=c, label=one_line(glabel(k.split("|")[1])))
+    for (k, kind, gk), c in zip(entries, cols[1:]):
+        ax[1].scatter(ref_closed, res["runs"][k]["closed"], s=14 if kind == "stochastic" else 24, alpha=0.6, color=c,
+                      marker="o" if kind == "stochastic" else "x", label=f"{kind} | {one_line(glabel(gk))}")
     top = max(ref_closed.max(), max(np.max(d) for d in closed[1:])) * 1.05
     ax[1].plot([0, top], [0, top], "k--", lw=1, label="same as plain A*")
     ax[1].set_xlabel("plain A*: expanded nodes")
-    ax[1].set_ylabel("stochastic A*: expanded nodes")
+    ax[1].set_ylabel("expanded nodes")
     ax[1].set_title("per-map comparison (below the line = fewer expansions)", fontsize=10)
-    ax[1].legend(fontsize=7)
+    ax[1].legend(fontsize=6)
     ax[1].grid(alpha=0.3)
-    fig.suptitle(f"test set '{res['set']}': stochastic A* with {one_line(hlabel(main_h))}", fontsize=11)
+    fig.suptitle(f"test set '{res['set']}': stochastic A* with {one_line(hlabel(main_h))} and Neural A* (hatched / crosses)",
+                 fontsize=11)
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
 
 
-def fig_examples(res, ts, main_h, heurs, guides, kw, seed, k, path):
+def fig_examples(res, ts, main_h, heurs, guides, neural_models, kw, seed, k, path, device="cpu"):
+    """Rows per map: (1) plain A* and stochastic A* with EVERY guidance source (constant and each learned model),
+    (2) the input map and Neural A* with the same guidance sources. Maps are picked from easy to hard for plain A*."""
     n = res["n"]
+    sn = res["set"]
     maps, starts, goals = ts["maps"], ts["starts"], ts["goals"]
     ref_closed = np.array(res["ref"]["closed"], float)
-    gks = [g for g in guides if g in ("phi1", "phi0.5")]
-    learned = [g for g in guides if g.startswith("learned_")]
-    pref = f"learned_{main_h[4:]}" if main_h.startswith("cnn_") else None
-    gks += [pref] if pref in guides else learned[:1]
+    gks = list(guides)
     pos = np.linspace(0, n - 1, min(k, n)).round().astype(int)
     idxs = [int(np.argsort(ref_closed)[p]) for p in pos]
     hu = heurs[main_h]
+    two = bool(neural_models)
+    rpm = 2 if two else 1
     ncol = 1 + len(gks)
-    fig, axes = plt.subplots(len(idxs), ncol, figsize=(3.7 * ncol, 4.3 * len(idxs)), squeeze=False)
+    fig, axes = plt.subplots(len(idxs) * rpm, ncol, figsize=(3.3 * ncol, 3.8 * len(idxs) * rpm), squeeze=False)
+
+    def gname(gk):
+        if gk.startswith("learned_"):
+            return f"learned Phi ({gk[8:]} model, {'in-distribution' if gk[8:] == sn else 'OOD'})"
+        return one_line(glabel(gk))
+
+    def draw(ax, free, s, g, rr, title, shortest, open_known=True):
+        ax.imshow(result_to_rgb(free, s, g, rr), interpolation="nearest")
+        info = f"closed {rr.n_closed}" + (f", open {rr.n_open}" if open_known else "") + \
+               f", path {rr.path_len if rr.found else 'not found'} (shortest {shortest})"
+        ax.set_title(f"{title}\n{info}", fontsize=7)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
     for r, i in enumerate(idxs):
         free, s, g = maps[i], starts[i], goals[i]
-        panels = [("plain A*", plain_astar(free, s, g))]
-        for gk in gks:
+        short = int(res["lengths"][i])
+        draw(axes[r * rpm, 0], free, s, g, plain_astar(free, s, g), f"plain A*  (map {i})", short)
+        for c, gk in enumerate(gks, 1):
             phi = guides[gk](free, s, g)
-            panels.append((f"stochastic | {one_line(glabel(gk))}", stochastic_astar(free, s, g, hu, phi, seed=seed + i, **kw)))
-        for c, (name, rr) in enumerate(panels):
-            axes[r, c].imshow(result_to_rgb(free, s, g, rr), interpolation="nearest")
-            axes[r, c].set_title(f"{name}\nmap {i}: closed {rr.n_closed}, open {rr.n_open}, "
-                                 f"path {rr.path_len if rr.found else 'not found'} (shortest {int(res['lengths'][i])})", fontsize=7)
-            axes[r, c].set_xticks([])
-            axes[r, c].set_yticks([])
+            rr = stochastic_astar(free, s, g, hu, phi, seed=seed + i, **kw)
+            draw(axes[r * rpm, c], free, s, g, rr, f"stochastic | {gname(gk)}", short)
+        if two:
+            img = base_img(free)
+            img[s], img[g] = (0, 0.8, 0), (1, 0, 0)
+            axes[r * rpm + 1, 0].imshow(img, interpolation="nearest")
+            axes[r * rpm + 1, 0].set_title(f"map {i}: input (S green, G red)", fontsize=7)
+            axes[r * rpm + 1, 0].set_xticks([])
+            axes[r * rpm + 1, 0].set_yticks([])
+            for c, gk in enumerate(gks, 1):
+                if gk in neural_models:
+                    draw(axes[r * rpm + 1, c], free, s, g, neural_example(neural_models[gk], free, s, g, device),
+                         f"Neural A* | {gname(gk)}", short, open_known=False)
+                else:
+                    axes[r * rpm + 1, c].axis("off")
     fig.legend(handles=[Patch(facecolor=np.array(COL[q]) / 255.0, edgecolor="0.5", label=lab) for q, lab in
-                        (("path", "path"), ("closed", "closed = expanded"), ("open", "open = discovered only"),
+                        (("path", "path"), ("closed", "closed = expanded"), ("open", "open = discovered only (not shown for Neural A*)"),
                          ("free", "free, never touched"), ("wall", "wall"), ("start", "start"), ("goal", "goal"))],
                loc="lower center", ncol=7, fontsize=8, frameon=False)
-    fig.suptitle(f"test set '{res['set']}': {one_line(hlabel(main_h))} (maps picked from easy to hard for plain A*)", fontsize=10)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.97), h_pad=3.0)
-    fig.savefig(path, dpi=110)
+    htag = (" (in-distribution)" if main_h == "cnn_" + sn else " (OOD)") if main_h.startswith("cnn_") else ""
+    fig.suptitle(f"test set '{sn}': stochastic A* with {one_line(hlabel(main_h))}{htag}"
+                 f"{' and Neural A* (Chebyshev h)' if two else ''}; every guidance source side by side "
+                 f"(maps picked from easy to hard for plain A*)", fontsize=10)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97), h_pad=3.0)
+    fig.savefig(path, dpi=100)
     plt.close(fig)
 
 
@@ -677,11 +843,15 @@ def parse_args(argv=None):
     ap.add_argument("--heuristic-root", default=None, help="default ROOT/runs/heuristics")
     ap.add_argument("--out-dir", default=None, help="default ROOT/comparison")
     ap.add_argument("--ckpt", choices=["best", "last"], default="best", help="which guidance checkpoint to use")
-    ap.add_argument("--eval-sets", default="rect", help="comma list of test sets for the stochastic-A* comparison (rect,maze,noise)")
-    ap.add_argument("--main-heuristic", default="maze", help="rect | maze | noise | minkowski: used for the headline / distribution / example figures")
+    ap.add_argument("--eval-sets", default="rect,maze,noise", help="comma list of test sets for the comparison (rect,maze,noise)")
+    ap.add_argument("--main-heuristic", default="maze",
+                    help="rect | maze | noise | minkowski | matched (= the CNN trained on the style of each test set): "
+                         "used for the headline / distribution / example figures")
     ap.add_argument("--const-phis", default="1,0.5", help="constant guidance maps used as 'no guidance'")
     ap.add_argument("--n", type=int, default=100, help="maps per evaluation set (0 = all)")
-    ap.add_argument("--n-examples", type=int, default=4, help="rows in the search-example figure")
+    ap.add_argument("--n-examples", type=int, default=3, help="maps in the search-example figure (2 rows each)")
+    ap.add_argument("--neural", choices=["auto", "on", "off"], default="auto",
+                    help="add Neural A* (differentiable search) to the tables / bars / pictures; auto = only with a GPU")
     ap.add_argument("--neural-eval", type=int, default=-1,
                     help="maps per test set for the Neural A* cross evaluation (0 = skip, -1 = 64 on GPU, skip on CPU)")
     ap.add_argument("--reuse-results", action="store_true", help="load results_per_map.json instead of running the searches")
@@ -702,7 +872,7 @@ def parse_args(argv=None):
     args.guidance_root = args.guidance_root or os.path.join(args.root, "runs", "guidance")
     args.heuristic_root = args.heuristic_root or os.path.join(args.root, "runs", "heuristics")
     args.out_dir = args.out_dir or os.path.join(args.root, "comparison")
-    args.main_h = "minkowski" if args.main_heuristic == "minkowski" else f"cnn_{args.main_heuristic}"
+    args.main_h = args.main_heuristic if args.main_heuristic in ("minkowski", "matched") else f"cnn_{args.main_heuristic}"
     return args
 
 
@@ -743,9 +913,31 @@ def main(argv=None):
         log("no evaluation test set found, stopping after the curve figures")
         return
     heurs, guides = load_sources(args, device)
-    if args.main_h not in heurs:
+    if args.main_h != "matched" and args.main_h not in heurs:
         log(f"[warn] main heuristic '{args.main_h}' is not available -> using '{next(iter(heurs))}' for the headline figures")
         args.main_h = next(iter(heurs))
+
+    def main_h_for(sn):
+        if args.main_h != "matched":
+            return args.main_h
+        return f"cnn_{sn}" if f"cnn_{sn}" in heurs else "minkowski"
+
+    use_neural = args.neural == "on"
+    if args.neural == "auto":
+        try:
+            import torch
+            use_neural = torch.cuda.is_available()
+        except ImportError:
+            use_neural = False
+    neural_models = OrderedDict()
+    if use_neural:
+        try:
+            neural_models = build_neural_models(guides, device)
+            log(f"Neural A* rows enabled for {len(neural_models)} guidance sources")
+        except Exception as e:                                           # noqa: BLE001
+            log(f"[warn] Neural A* could not be set up ({e!r}) -> rows skipped")
+    else:
+        log("[skip] Neural A* rows in the comparison (--neural on to force; slow without a GPU)")
     kw = dict(k_min=args.k_min, k_max=args.k_max, ref_std=args.ref_std, c_sig=args.c_sig, c_b=args.c_b,
               rank_power=args.rank_power, reduce=args.reduce, stop_on=args.stop_on)
 
@@ -758,7 +950,7 @@ def main(argv=None):
     else:
         results = OrderedDict()
         for sn, ts in tests.items():
-            results[sn] = evaluate_set(sn, ts, heurs, guides, kw, args.seed, args.n)
+            results[sn] = evaluate_set(sn, ts, heurs, guides, kw, args.seed, args.n, neural_models, device)
             with open(per_map_path, "w") as f:                              # save after every set (long runs)
                 json.dump(results, f)
     write_tables(results, args.out_dir)
@@ -767,11 +959,12 @@ def main(argv=None):
 
     for sn, res in results.items():
         ref, A = aggregate(res)
-        stage(f"06 headline ({sn})", fig_headline, res, ref, A, args.main_h, out(f"06_headline_{sn}.png"))
+        mh = main_h_for(sn)
+        stage(f"06 headline ({sn})", fig_headline, res, ref, A, mh, out(f"06_headline_{sn}.png"))
         stage(f"07 all combinations ({sn})", fig_matrix, res, ref, A, out(f"07_all_combinations_{sn}.png"))
-        stage(f"08 distributions ({sn})", fig_distributions, res, A, args.main_h, out(f"08_distributions_{sn}.png"))
-        stage(f"09 search examples ({sn})", fig_examples, res, tests[sn], args.main_h, heurs, guides, kw, args.seed,
-              args.n_examples, out(f"09_search_examples_{sn}.png"))
+        stage(f"08 distributions ({sn})", fig_distributions, res, A, mh, out(f"08_distributions_{sn}.png"))
+        stage(f"09 search examples ({sn})", fig_examples, res, tests[sn], mh, heurs, guides, neural_models, kw, args.seed,
+              args.n_examples, out(f"09_search_examples_{sn}.png"), device)
 
     stage("04 guidance maps", fig_guidance_gallery, tests_all, guides, out("04_guidance_maps.png"))
     stage("05 heuristic maps", fig_heuristic_gallery, tests_all, heurs, out("05_heuristic_maps.png"))
