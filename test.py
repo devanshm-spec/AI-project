@@ -1,9 +1,9 @@
 """
 Evaluate a trained Neural A* checkpoint, or inspect one test map.
-
+ 
 Whole test set (Opt / Exp / Hmean + a few example plots):
     python test.py --checkpoint runs/neural_astar/best.pt --data data/test.npz
-
+ 
 One test map (picture of the map and its guidance map):
     python test.py --checkpoint runs/neural_astar/best.pt --data data/test.npz --index 5
     python test.py --checkpoint runs/neural_astar/best.pt --data data/test.npz --random
@@ -13,15 +13,15 @@ Right panel: the guidance map in a single colour; darker = higher cost.
 import argparse
 import json
 import os
-
+ 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-
+ 
 from neural_astar import NeuralAStar, PlanningDataset, evaluate, plan_single
 from train import save_examples
-
-
+ 
+ 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -39,7 +39,7 @@ def main():
                     help="scale guidance colours to [min, max] of this map instead of [0, 1]")
     ap.add_argument("--mask-walls", action="store_true", help="paint obstacles black in the guidance panel")
     args = ap.parse_args()
-
+ 
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt["config"]
@@ -53,7 +53,7 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
     print(f"loaded {args.checkpoint} (epoch {ckpt['epoch']})")
-
+ 
     ds = PlanningDataset.from_npz(args.data, invert_map=args.invert_map)
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.checkpoint))
     if not os.access(out_dir, os.W_OK):               # e.g. /kaggle/input is read-only
@@ -61,7 +61,7 @@ def main():
         print(f"{out_dir} is read-only -> writing results to {fallback}")
         out_dir = fallback
     os.makedirs(out_dir, exist_ok=True)
-
+ 
     # ---------------- single-map mode ----------------
     if args.index is not None or args.random:
         from view_example import render_pair          # only needed here (your own helper file)
@@ -81,7 +81,7 @@ def main():
               f"(ground truth {int(ds.paths[i].sum())})")
         print(f"saved {out_path}")
         return
-
+ 
     # ---------------- whole test set ----------------
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
     res = evaluate(model, loader, device)
@@ -104,11 +104,7 @@ def main():
         fig_path = os.path.join(out_dir, "test_examples.png")
         save_examples(model, ds, device, fig_path, args.n_vis)
         print(f"saved {fig_path}")
-
-
-if __name__ == "__main__":
-    main()
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
