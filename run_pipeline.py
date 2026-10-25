@@ -31,6 +31,15 @@ STYLES = {
 }
 
 
+def guidance_done(folder, epochs):
+    """Finished = best.pt + last.pt exist AND log.csv has all epochs (best/last.pt already exist after epoch 1)."""
+    log = os.path.join(folder, "log.csv")
+    if not (os.path.exists(os.path.join(folder, "best.pt")) and os.path.exists(log)):
+        return False
+    with open(log) as f:
+        return sum(1 for _ in f) - 1 >= epochs
+
+
 def run(cmd):
     print("\n$ " + " ".join(cmd), flush=True)
     t0 = time.time()
@@ -82,8 +91,8 @@ def main():
 
     if "guidance" in steps:
         for s in styles:
-            if not args.force and os.path.exists(gdir(s, "best.pt")) and os.path.exists(gdir(s, "last.pt")):
-                print(f"[skip] guidance model for {s} exists")
+            if not args.force and guidance_done(gdir(s), args.guidance_epochs):
+                print(f"[skip] guidance model for {s} is complete")
                 continue
             run([py, "train.py", "--train-data", data(s, "train.npz"), "--val-data", data(s, "val.npz"),
                  "--epochs", str(args.guidance_epochs), "--batch-size", str(args.guidance_batch_size),
