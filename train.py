@@ -301,7 +301,7 @@ def main():
 
     if args.n_vis > 0:
         try:
-            best = torch.load(os.path.join(args.out_dir, "best.pt"), map_location=device)
+            best = torch.load(os.path.join(args.out_dir, "best.pt"), map_location=device, weights_only=False)
             model.load_state_dict(best["model"])
             fig_path = os.path.join(args.out_dir, "examples.png")
             save_examples(model, val_ds, device, fig_path, args.n_vis)
