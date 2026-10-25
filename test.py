@@ -56,6 +56,10 @@ def main():
 
     ds = PlanningDataset.from_npz(args.data, invert_map=args.invert_map)
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.checkpoint))
+    if not os.access(out_dir, os.W_OK):               # e.g. /kaggle/input is read-only
+        fallback = os.path.join(os.getcwd(), "test_outputs")
+        print(f"{out_dir} is read-only -> writing results to {fallback}")
+        out_dir = fallback
     os.makedirs(out_dir, exist_ok=True)
 
     # ---------------- single-map mode ----------------
@@ -83,12 +87,27 @@ def main():
     res = evaluate(model, loader, device)
     print(f"test samples: {len(ds)}")
     print(f"Opt {res['opt']:.2f} | Exp {res['exp']:.2f} | Hmean {res['hmean']:.2f} | L1 loss {res['loss']:.4f}")
+    # Is Phi lower on the ground-truth path than on other free cells? (guidance only, no search -> fast)
+    on, off = [], []
+    with torch.no_grad():
+        for batch in loader:
+            m, s, g, p = (batch[k].to(device) for k in ("map", "start", "goal", "path"))
+            phi = model.guidance(m, s, g)
+            on.append(phi[(p > 0.5) & (m > 0.5)].cpu())
+            off.append(phi[(p < 0.5) & (m > 0.5)].cpu())
+    on, off = torch.cat(on), torch.cat(off)
+    print(f"mean Phi on ground-truth path cells {on.mean():.3f} | on all other free cells {off.mean():.3f}")
+    res["phi_on_path"], res["phi_off_path"] = on.mean().item(), off.mean().item()
     with open(os.path.join(out_dir, "test_metrics.json"), "w") as f:
         json.dump(res, f, indent=2)
     if args.n_vis > 0:
         fig_path = os.path.join(out_dir, "test_examples.png")
         save_examples(model, ds, device, fig_path, args.n_vis)
         print(f"saved {fig_path}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
