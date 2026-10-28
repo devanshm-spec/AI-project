@@ -756,7 +756,7 @@ def main():
         p.add_argument("--std-source", choices=["best", "open-mean", "open-spatial"], default="best",
                        help="best: std across the members at the lowest-value open node (default); open-mean: that "
                             "std averaged over the open set; open-spatial: old behaviour, std of h over open cells")
-        p.add_argument("--k-dir", choices=["low-std-large-k", "high-std-large-k"], default="low-std-large-k",
+        p.add_argument("--k-dir", choices=["low-std-large-k", "high-std-large-k"], default="high-std-large-k",
                        help="low-std-large-k (default): K large when the members agree, small when they disagree; "
                             "high-std-large-k: the previous, opposite behaviour")
         p.add_argument("--ref-heuristic", choices=list(REF_HEURISTICS), default="chebyshev",
