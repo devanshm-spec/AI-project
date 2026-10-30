@@ -420,28 +420,34 @@ def draw_hist(ax, res):
 
 
 def describe(i, d, free, start, goal, ours, cheb, euc, h_mean, h_std, ref_std, t_cnn, opt_len, n_nets, metric):
-    cheb_d = max(abs(start[0] - goal[0]), abs(start[1] - goal[1]))
+    def plen(r):
+        if not r.found:
+            return "not found"
+        return f"{r.path_len} (optimal)" if r.path_len <= opt_len else f"{r.path_len} (+{r.path_len - opt_len})"
+
     key = (lambda r: r.n_expanded) if metric == "expanded" else (lambda r: r.discovered)
-    L = [f"=== sample {i:04d} ===",
-         f"map {free.shape[0]}x{free.shape[1]}, free fraction {free.mean():.3f}, start {tuple(start)}, goal {tuple(goal)}, "
-         f"Chebyshev start-goal distance {cheb_d}, optimal path {opt_len} cells",
-         f"heuristic ensemble: {n_nets} CNNs, inference {t_cnn * 1e3:.1f} ms (not included in the search times); "
-         f"h_mean on free cells: min {h_mean[free > 0].min():.2f} / mean {h_mean[free > 0].mean():.2f} / "
-         f"max {h_mean[free > 0].max():.2f}; h_std: mean {h_std[free > 0].mean():.3f} / max {h_std[free > 0].max():.3f}; "
-         f"ref_std {ref_std:.3f}"]
-    for r in (ours, cheb, euc):
-        ratio = f", path/optimal = {r.path_len / opt_len:.3f}" if r.found else ""
-        L.append(f"- {r.name}: found={r.found}, nodes expanded (closed) {r.n_expanded}, nodes discovered (ever in open) "
-                 f"{r.discovered}, left in open {len(r.open_final)}, unique expanded {r.n_unique}, path length {r.path_len} cells{ratio}, "
-                 f"time {r.time * 1e3:.2f} ms")
+
+    def change(r):
+        pct = (1 - key(ours) / key(r)) * 100
+        return f"{abs(pct):.0f}% {'fewer' if pct >= 0 else 'more'} nodes than {r.name}"
+
+    L = [f"=== Sample {i} ===",
+         f"Map {free.shape[0]}x{free.shape[1]}, {free.mean() * 100:.0f}% free | start {tuple(start)} -> goal {tuple(goal)} "
+         f"| shortest path {opt_len} cells",
+         "",
+         f"{'Method':<22}{'Expanded':>9}{'Opened':>8}{'Path length':>17}{'Time (ms)':>11}"]
+    for name, r in (("Stochastic CNN A*", ours), ("A* Chebyshev", cheb), ("A* Euclidean", euc)):
+        L.append(f"{name:<22}{r.n_expanded:>9}{r.discovered:>8}{plen(r):>17}{r.time * 1e3:>11.1f}")
+    L += ["",
+          f"Result: ours used {change(cheb)}, and {change(euc)}."]
     h = ours.hist
+    extra = f"{n_nets} CNNs (inference {t_cnn * 1e3:.0f} ms, not counted in the times)"
     if len(h.get("K", [])):
-        L.append(f"- re-opened (closed -> open again after a cheaper route): {ours.reopened} nodes")
-        L.append(f"- stochastic details: K mean {h['K'].mean():.1f} / max {h['K'].max()}, |open| mean {h['S'].mean():.1f} / "
-                 f"max {h['S'].max()}, sigma_eff mean {h['sigma_eff'].mean():.3f}, h of expanded node first "
-                 f"{h['h_selected'][0]:.2f} -> last {h['h_selected'][-1]:.2f}")
-    L.append(f"- node ratio ours/A*(Chebyshev) = {key(ours) / key(cheb):.3f}, ours/A*(Euclidean) = {key(ours) / key(euc):.3f} "
-             f"(metric: {metric})")
+        extra += f"; avg {h['K'].mean():.1f} candidates picked from {h['S'].mean():.1f} open nodes"
+        if ours.reopened:
+            extra += f"; {ours.reopened} nodes re-opened"
+    L.append(f"Notes: {extra}.")
+    L.append("(Expanded = nodes taken out of the open list; Opened = nodes that ever entered it.)")
     return "\n".join(L)
 
 
