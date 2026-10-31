@@ -46,7 +46,7 @@ REF_STD (sigma at which K = S/2), in this order of priority
 OUTPUT (all under --out-dir)
     examples/sample_XXXX/   overview.png (all panels) + search_ours.png, search_astar_chebyshev.png,
                             search_astar_euclidean.png, heatmap_h_mean.png, heatmap_h_std.png,
-                            h_over_iterations.png, description.txt
+                            heatmap_guidance.png (guidance map Phi), h_over_iterations.png, description.txt
     scatter/                scatter_nodes.png (x = plain A* nodes, y = ours; Chebyshev and Euclidean)
     tables/                 summary.csv, summary.json, report.txt (all example descriptions + aggregate stats)
 
@@ -57,8 +57,9 @@ USAGE
 NOTES
     * "full" input-mode nets also take Phi as input: it is the guidance map when --phi-checkpoint is given,
       otherwise a constant --phi-const (default 1; use the value the nets were trained with).
-    * plain A* always uses unit step costs; with --g-mode guidance our path cost is in Phi units, so compare nodes,
-      not costs.
+    * the plain A* baselines (Chebyshev / Euclidean) ALWAYS use the constant cost matrix g = 1 per step, never the
+      guidance map; only our stochastic search uses Phi (with --g-mode guidance).  Path lengths are reported in cells,
+      and "optimal" is the unit-cost shortest path, so with guidance our path can legitimately be longer than optimal.
 """
 import argparse
 import csv
@@ -337,9 +338,13 @@ def heuristic_map(shape, goal, kind):
     return np.maximum(dr, dc) if kind == "chebyshev" else np.sqrt(dr ** 2 + dc ** 2)
 
 
-def plain_astar(free, start, goal, kind):
-    """Textbook A*, 8 neighbours, unit step cost, corner cutting allowed (same grid as the data generator)."""
+def plain_astar(free, start, goal, kind, cost=None):
+    """Textbook A*, 8 neighbours, corner cutting allowed (same grid as the data generator).
+    g uses the CONSTANT cost matrix of 1 (never the guidance map Phi): this is the generic A* reference.
+    The Chebyshev / Euclidean heuristics are only meaningful for unit costs, so `cost` should stay None."""
     H, W = free.shape
+    if cost is None:
+        cost = np.ones((H, W))
     t0 = time.perf_counter()
     hm = heuristic_map(free.shape, goal, kind)
     g = {start: 0}
@@ -358,13 +363,13 @@ def plain_astar(free, start, goal, kind):
         for dr, dc in NEIGHBORS:
             m = (n[0] + dr, n[1] + dc)
             if 0 <= m[0] < H and 0 <= m[1] < W and free[m] and m not in closed:
-                ng = g[n] + 1
+                ng = g[n] + cost[m]
                 if ng < g.get(m, math.inf):
                     g[m], parent[m] = ng, n
                     heapq.heappush(heap, (ng + hm[m], hm[m], m))
     dt = time.perf_counter() - t0
     open_final = [k for k in g if k not in closed]
-    return Result(f"A* ({kind})", found, backtrack(parent, goal) if found else [], expanded, len(g), dt,
+    return Result(f"A* {kind} (g=1)", found, backtrack(parent, goal) if found else [], expanded, len(g), dt,
                   open_final, parent)
 
 
@@ -441,7 +446,7 @@ def describe(i, d, free, start, goal, ours, cheb, euc, h_mean, h_std, ref_std, t
     L += ["",
           f"Result: ours used {change(cheb)}, and {change(euc)}."]
     h = ours.hist
-    extra = f"{n_nets} CNNs (inference {t_cnn * 1e3:.0f} ms, not counted in the times)"
+    extra = f"plain A* runs use g = 1 per step (no guidance map); {n_nets} CNNs (inference {t_cnn * 1e3:.0f} ms, not counted in the times)"
     if len(h.get("K", [])):
         extra += f"; avg {h['K'].mean():.1f} candidates picked from {h['S'].mean():.1f} open nodes"
         if ours.reopened:
@@ -451,7 +456,7 @@ def describe(i, d, free, start, goal, ours, cheb, euc, h_mean, h_std, ref_std, t
     return "\n".join(L)
 
 
-def save_example(i, root, free, start, goal, ours, cheb, euc, h_mean, h_std, text):
+def save_example(i, root, free, start, goal, ours, cheb, euc, h_mean, h_std, text, phi, phi_title):
     d = os.path.join(root, f"sample_{i:04d}")
     os.makedirs(d, exist_ok=True)
     singles = [("search_ours.png", lambda a, f: draw_search(a, free, start, goal, ours, graph=True)),
@@ -459,13 +464,17 @@ def save_example(i, root, free, start, goal, ours, cheb, euc, h_mean, h_std, tex
                ("search_astar_euclidean.png", lambda a, f: draw_search(a, free, start, goal, euc)),
                ("heatmap_h_mean.png", lambda a, f: draw_heat(a, f, h_mean, free, start, goal, "mean h of the CNNs")),
                ("heatmap_h_std.png", lambda a, f: draw_heat(a, f, h_std, free, start, goal, "std of h across the CNNs")),
+               ("heatmap_guidance.png", lambda a, f: draw_heat(a, f, phi, free, start, goal, phi_title)),
                ("h_over_iterations.png", lambda a, f: draw_hist(a, ours))]
     for name, fn in singles:
-        fig, ax = plt.subplots(figsize=(6, 6) if name != "h_over_iterations.png" else (7, 4))
+        fig, ax = plt.subplots(figsize=(6.5, 6) if name != "h_over_iterations.png" else (7, 4))
         fn(ax, fig)
         fig.tight_layout(); fig.savefig(os.path.join(d, name), dpi=130); plt.close(fig)
-    fig, axs = plt.subplots(2, 3, figsize=(16, 10.5))
+    fig, axs = plt.subplots(2, 4, figsize=(21, 10.5))
+    for ax in axs.ravel():
+        ax.axis("off")
     for (name, fn), ax in zip(singles, axs.ravel()):
+        ax.axis("on")
         fn(ax, fig)
     fig.suptitle(text.split("\n")[1], fontsize=9)
     fig.tight_layout(); fig.savefig(os.path.join(d, "overview.png"), dpi=130); plt.close(fig)
@@ -496,7 +505,7 @@ def save_scatter(rows, out_dir, metric):
 # ======================================================================================
 # 5. Main
 # ======================================================================================
-def prepare_map(i, data, nets, phi_model, args):
+def prepare_map(i, data, nets, phi_model, args, return_phi=False):
     """Everything computed before the search: CNN mean / std per pixel and the step-cost matrix."""
     free = data["maps"][i]
     start, goal = tuple(int(x) for x in data["starts"][i]), tuple(int(x) for x in data["goals"][i])
@@ -506,6 +515,8 @@ def prepare_map(i, data, nets, phi_model, args):
     t_cnn = time.perf_counter() - t0
     h_mean, h_std = stack.mean(0) * args.h_scale, stack.std(0) * args.h_scale
     cost = phi if args.g_mode == "guidance" else np.ones(free.shape)
+    if return_phi:
+        return free, start, goal, h_mean, h_std, cost, t_cnn, phi
     return free, start, goal, h_mean, h_std, cost, t_cnn
 
 
@@ -580,7 +591,7 @@ def main():
 
     rows, reports = [], []
     for i in range(n):
-        free, start, goal, h_mean, h_std, cost, t_cnn = prepare_map(i, data, nets, phi_model, args)
+        free, start, goal, h_mean, h_std, cost, t_cnn, phi = prepare_map(i, data, nets, phi_model, args, return_phi=True)
         cheb = plain_astar(free, start, goal, "chebyshev")
         euc = plain_astar(free, start, goal, "euclidean")
         opt_len = int(data["lengths"][i]) if "lengths" in data else cheb.path_len
@@ -601,7 +612,13 @@ def main():
                             len(nets), args.count_metric)
             print(text + "\n")
             reports.append(text)
-            save_example(i, ex_dir, free, start, goal, ours, cheb, euc, h_mean, h_std, text)
+            if phi_model:
+                phi_title = "guidance map Phi (Neural A*)\n" + ("used as step cost g" if args.g_mode == "guidance"
+                                                                else "not used for g (g-mode const: cost 1)")
+            else:
+                phi_title = (f"no guidance map: constant Phi = {args.phi_const:g}\n(fed to 'full'-mode nets; "
+                             f"g uses cost 1)")
+            save_example(i, ex_dir, free, start, goal, ours, cheb, euc, h_mean, h_std, text, phi, phi_title)
 
     # ---- aggregate ---------------------------------------------------------------------------------------------
     key = "exp" if args.count_metric == "expanded" else "disc"
