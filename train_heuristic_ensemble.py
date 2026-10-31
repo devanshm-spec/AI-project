@@ -24,11 +24,39 @@ Loss (all errors are measured in units of C*, so short and long routes weigh the
     foff      max(0, C* - g*(v) - h(v)) / C* on off-path cells   (f = g* + h should reach C*, so A* skips them;
               this bound is never above h*(v), so it cannot conflict with admissibility)
 With weights w_over_on : w_under = 20 : 1 the asymmetric loss is a pinball loss whose optimum is the ~5%
-quantile of h* given the input, i.e. h is deliberately conservative.
+quantile of h* given the input, i.e. h is deliberately conservative (--preset admissible).  In mazes that makes every
+member collapse to its analytic lower bound (Chebyshev), because the net cannot resolve dead ends exactly.
+
+--preset detour (default) trains for the *f landscape*:  f^(v) = g*(v) + h(v)  should look like f*(v) = g*(v) + h*(v),
+    i.e. f^ - C* = 0 on the shortest path and growing with the detour d*(v) = (g* + h* - C*) / C* around it.
+    fit       two-sided Huber on (h - h*)/C*, weighted by  floor + (1 - floor) * exp(-d*(v) / band_tau),
+              so cells on / near the shortest path dominate and far-away cells only keep a weak weight
+    the asymmetric weights are balanced (1 : 1 : 1, median instead of the 5% quantile) and the consistency weight is low
+    --refine-iters K  adds K steps of a shared 3x3 residual conv that only exchanges information between FREE cells
+              (masked by the map): a learnable distance propagation around walls, which a plain U-Net cannot do in mazes
+    Diagnostics: f_on = mean |f^ - C*| / C* on shortest-path cells (0 = the path has the lowest f),
+                 f_corr = per-map correlation between the predicted and the true detour map (1 = same picture as g*+h*-C*).
+    h is then NOT guaranteed admissible; check cost/C* in the A* evaluation printed at the end.
 
 Network: small U-Net, input = [free, start, goal, cheb-dist-to-start, cheb-dist-to-goal, Phi*free],
     h = c_min * Chebyshev(v, goal) + h_scale * softplus(z)      (the first term is an admissible, consistent
     analytic bound, so every member starts from a safe heuristic and only learns the extra cost).
+
+Calibrated scale (--head ratio, default):  the network predicts a COST PER CHEBYSHEV STEP rho(v) instead of an absolute offset,
+    h(v) = Cheb(v, goal) * rho(v)  +  h_scale * softplus(z2) * (1 - goal),     rho = c_min + ratio_span * c_mean * softplus(z1)
+    so h is tied to the distance to the goal and lives in the same units as Phi (20 cells away on cells costing ~0.25 per
+    step gives h ~ 5, not 30 or 40).  h(goal) = 0 exactly.  The additive branch is only for detours (walls, mazes), its scale
+    h_scale is set from the data (99th percentile of h* - c_min*Cheb) unless --h-scale is given.
+    --head additive restores the old parametrisation.  Extra network inputs (--no-scale-feat to drop them): Phi averaged over
+    5x5 and 15x15 free neighbourhoods, c_mean*Cheb_goal/W, c_min*Cheb_goal/W.
+    Extra loss  logfit: |log(h + eps) - log(h* + eps)| on labelled cells (eps = 2% of C*), a relative-error term that
+    keeps the absolute scale right near the goal and far away alike  (--w-logfit).
+    Diagnostics: at start-up the script prints h*/Cheb per distance bin (what cost per step the targets actually imply) and after
+    training a calibration table  mean h/h*  per distance-to-goal bin for every member and the ensemble mean (flat at 1 = calibrated).
+
+--input-mode minimal: the network sees only 4 channels [free, start, goal, Phi*free] (no distance maps, no window averages).
+    The output formula is unchanged (h = Cheb * rho + ..., rho from c_min / c_mean of Phi), so the scale is still tied to the
+    distance to the goal; the network just has to work out the geometry itself.  Use --head ratio (default).
 
 --input-mode rgb: the network sees ONLY the 3-channel image [R = goal, G = start, B = free (1 = free, 0 = wall)], no
     distance channels and no Phi. h = Chebyshev(v, goal) + h_scale * softplus(z) (unit-cost lower bound). Use it together
@@ -336,6 +364,56 @@ def report_targets(name, d, mode):
     print(f"   labelled cells per map: on-path {d['on'].sum((1, 2)).mean():.0f}, off-path {d['off'].sum((1, 2)).mean():.0f}")
 
 
+def cheb_np(shape, pt):
+    H, W = shape
+    return np.maximum(np.abs(np.arange(H)[:, None] - int(pt[0])), np.abs(np.arange(W)[None, :] - int(pt[1])))
+
+
+def report_scale(name, d, max_maps=300):
+    """What cost per Chebyshev step do the exact targets imply?  (h* / Cheb(v, goal) on labelled cells)"""
+    n = min(max_maps, len(d["free"]))
+    edges = [3, 0.1, 0.25, 0.5, 1.01]
+    ratios, dists, cmins, cmeans, cs = [], [], [], [], []
+    for i in range(n):
+        lab = d["lab"][i] > 0
+        if not lab.any():
+            continue
+        ch = cheb_np(d["free"][i].shape, d["goals"][i])
+        m = lab & (ch >= 3)
+        ratios.append(d["h_star"][i][m] / ch[m])
+        dists.append(ch[m] / d["free"][i].shape[1])
+        fr = d["free"][i] > 0
+        cmins.append(d["phi"][i][fr].min())
+        cmeans.append(d["phi"][i][fr].mean())
+        cs.append(d["C"][i] / max(cheb_np(d["free"][i].shape, d["goals"][i])[tuple(d["starts"][i])], 1))
+    if not ratios:
+        return
+    r, dist = np.concatenate(ratios), np.concatenate(dists)
+    q = np.percentile(r, [5, 25, 50, 75, 95])
+    print(f"[{name}] Phi: c_min {np.mean(cmins):.3f}, mean {np.mean(cmeans):.3f} | optimal cost per Chebyshev step "
+          f"C*/Cheb(start,goal): {np.mean(cs):.3f}")
+    print(f"[{name}] h*/Cheb(v,goal) percentiles 5/25/50/75/95: " + " / ".join(f"{x:.3f}" for x in q) +
+          "   <- the cost per step the heuristic must reproduce (20 cells away => h ~ 20 x median)")
+    bins = [(0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 1.01)]
+    print("   median h*/Cheb by distance-to-goal (fraction of map width): " +
+          "  ".join(f"[{a:.2f},{min(b, 1):.2f}) {np.median(r[(dist >= a) & (dist < b)]):.3f}"
+                    for a, b in bins if ((dist >= a) & (dist < b)).any()))
+
+
+def auto_h_scale(d, max_maps=500):
+    """99th percentile of h* - c_min*Cheb on labelled cells: the largest extra cost the additive branch has to express."""
+    res = []
+    for i in range(min(max_maps, len(d["free"]))):
+        lab = d["lab"][i] > 0
+        if not lab.any():
+            continue
+        fr = d["free"][i] > 0
+        cmin = d["phi"][i][fr].min()
+        ch = cheb_np(d["free"][i].shape, d["goals"][i])
+        res.append((d["h_star"][i] - cmin * ch)[lab])
+    return max(1.0, float(np.percentile(np.concatenate(res), 99))) if res else 1.0
+
+
 # ======================================================================================
 # 4. Dataset (torch)
 # ======================================================================================
@@ -396,48 +474,93 @@ def conv_block(i, o):
 
 
 class HeuristicUNet(nn.Module):
-    def __init__(self, in_ch, width, depth):
+    def __init__(self, in_ch, width, depth, refine_iters=0, out_bias=-4.0, out_ch=1):
         super().__init__()
+        self.refine_iters = refine_iters
         ch = [width * 2 ** i for i in range(depth + 1)]
         self.enc = nn.ModuleList([conv_block(in_ch, ch[0])] + [conv_block(ch[i], ch[i + 1]) for i in range(depth)])
         self.up = nn.ModuleList([nn.ConvTranspose2d(ch[i + 1], ch[i], 2, stride=2) for i in reversed(range(depth))])
         self.dec = nn.ModuleList([conv_block(2 * ch[i], ch[i]) for i in reversed(range(depth))])
-        self.out = nn.Conv2d(ch[0], 1, 1)
-        nn.init.constant_(self.out.bias, -4.0)             # start close to the analytic lower bound
+        self.out = nn.Conv2d(ch[0], out_ch, 1)
+        nn.init.constant_(self.out.bias, out_bias)         # -4: start at the analytic lower bound
+        if out_ch > 1:                                     # 2nd (additive detour) branch starts even closer to zero
+            with torch.no_grad():
+                self.out.bias[1:] = out_bias - 3.0
+        if refine_iters > 0:                               # shared residual step, starts as the identity
+            self.prop = nn.Sequential(nn.Conv2d(ch[0], ch[0], 3, padding=1), nn.ReLU(inplace=True),
+                                      nn.Conv2d(ch[0], ch[0], 3, padding=1))
+            nn.init.zeros_(self.prop[2].weight)
+            nn.init.zeros_(self.prop[2].bias)
 
-    def forward(self, x):
+    def forward(self, x, free=None):
         feats = [self.enc[0](x)]
         for e in self.enc[1:]:
             feats.append(e(F.max_pool2d(feats[-1], 2)))
         h = feats[-1]
         for up, dec, skip in zip(self.up, self.dec, reversed(feats[:-1])):
             h = dec(torch.cat([skip, up(h)], dim=1))
+        if self.refine_iters > 0:                          # information only moves between free cells
+            for _ in range(self.refine_iters):
+                h = (h + self.prop(h)) * free
         return self.out(h)
+
+
+def masked_avg(phi, free, k):
+    """Average of phi over the free cells of a k x k window (k odd), zero on obstacles."""
+    num = F.avg_pool2d(phi * free, k, 1, k // 2, count_include_pad=False)
+    den = F.avg_pool2d(free, k, 1, k // 2, count_include_pad=False)
+    return num / den.clamp(min=1e-3) * free
 
 
 class HeuristicNet(nn.Module):
     """h(v) >= 0 for one (map, start, goal, Phi) problem; zero on obstacles.
 
-    input_mode "full": input [free, start, goal, cheb-to-start, cheb-to-goal, Phi*free] (6 channels), lower bound c_min*Cheb.
+    input_mode "full": input [free, start, goal, cheb-to-start, cheb-to-goal, Phi*free (+4 scale channels)], lower bound c_min*Cheb.
+    input_mode "minimal": input [free, start, goal, Phi*free] (4 channels, no distance or scale channels); the ratio head
+                       still gets Cheb(v, goal), c_min and c_mean outside the network.
     input_mode "rgb" : input [goal (R), start (G), free (B)] only (3 channels); Phi is ignored by the network and the
-                       analytic lower bound is the unit-cost Chebyshev distance."""
+                       analytic lower bound is the unit-cost Chebyshev distance.
+    head "ratio"     : h = Cheb * (c_min + ratio_span * c_mean * softplus(z1)) + h_scale * softplus(z2) * (1 - goal)
+    head "additive"  : h = lower bound + h_scale * softplus(z)          (original behaviour; default for old checkpoints)"""
 
-    def __init__(self, width=32, depth=4, h_scale=32.0, input_mode="full"):
+    N_SCALE_CH = 4
+
+    def __init__(self, width=32, depth=4, h_scale=32.0, input_mode="full", refine_iters=0, out_bias=-4.0,
+                 head="additive", ratio_span=4.0, scale_feat=False):
         super().__init__()
-        assert input_mode in ("full", "rgb"), "input_mode must be 'full' or 'rgb'"
-        self.input_mode = input_mode
-        self.body = HeuristicUNet(3 if input_mode == "rgb" else 6, width, depth)
+        assert input_mode in ("full", "rgb", "minimal"), "input_mode must be 'full', 'rgb' or 'minimal'"
+        assert head in ("ratio", "additive"), "head must be 'ratio' or 'additive'"
+        self.input_mode, self.head, self.ratio_span = input_mode, head, ratio_span
+        self.scale_feat = bool(scale_feat) and input_mode == "full"
+        in_ch = {"rgb": 3, "minimal": 4}.get(input_mode, 6 + (self.N_SCALE_CH if self.scale_feat else 0))
+        self.body = HeuristicUNet(in_ch, width, depth, refine_iters, out_bias, out_ch=2 if head == "ratio" else 1)
         self.h_scale = h_scale
 
     def forward(self, free, start, goal, phi):
         W = free.shape[-1]
+        cheb_g = cheb_dist(goal)
         if self.input_mode == "rgb":
             x = torch.cat([goal, start, free], dim=1)
-            lb = cheb_dist(goal) * free
+            cmin = cmean = torch.ones(free.shape[0], 1, 1, 1, device=free.device, dtype=free.dtype)
+            lb = cheb_g * free
         else:
-            x = torch.cat([free, start, goal, cheb_dist(start) / W, cheb_dist(goal) / W, phi * free], dim=1)
-            lb = lower_bound(free, goal, phi)
-        h = lb + self.h_scale * F.softplus(self.body(x))
+            cmin = (phi + (1.0 - free) * 1e3).amin(dim=(1, 2, 3), keepdim=True)
+            cmean = (phi * free).sum(dim=(1, 2, 3), keepdim=True) / free.sum(dim=(1, 2, 3), keepdim=True).clamp(min=1.0)
+            if self.input_mode == "minimal":
+                chans = [free, start, goal, phi * free]
+            else:
+                chans = [free, start, goal, cheb_dist(start) / W, cheb_g / W, phi * free]
+            if self.scale_feat:
+                chans += [masked_avg(phi, free, 5), masked_avg(phi, free, 15),
+                          cmean * cheb_g / W * free, cmin * cheb_g / W * free]
+            x = torch.cat(chans, dim=1)
+            lb = cmin * cheb_g * free
+        z = self.body(x, free)
+        if self.head == "ratio":
+            rho = cmin + self.ratio_span * cmean * F.softplus(z[:, :1])          # cost per Chebyshev step, >= c_min
+            h = cheb_g * rho + self.h_scale * F.softplus(z[:, 1:2]) * (1.0 - goal)
+        else:
+            h = lb + self.h_scale * F.softplus(z)
         return h * free
 
 
@@ -487,6 +610,15 @@ def heuristic_loss(h, b, w, delta):
         "goal": ((h * goal).flatten(1).sum(1) / scale.flatten()).abs().mean(),
         "foff": masked_mean(F.relu(C - gs - h) / scale, off),
     }
+    if w.get("fit", 0.0) > 0:                                # two-sided fit, focused on cells near the shortest path
+        detour = F.relu(gs + hs - C) / scale                 # d*(v): 0 on the shortest path
+        fl = w["band_floor"]
+        wgt = (fl + (1.0 - fl) * torch.exp(-detour / w["band_tau"])) * lab
+        parts["fit"] = masked_mean(huber(e.abs(), delta), wgt)
+    if w.get("logfit", 0.0) > 0:                             # relative (log) error: right scale near and far from the goal
+        eps = 0.02 * scale
+        rel = (torch.log(h + eps) - torch.log(hs + eps)).abs()
+        parts["logfit"] = masked_mean(huber(rel, delta), lab)
     total = sum(w[k] * v for k, v in parts.items())
     return total, parts
 
@@ -507,6 +639,15 @@ def batch_stats(h, b, tol=0.005):
         "goal_abs": (((h * goal).flatten(1).sum(1) / scale.flatten()).abs().sum(), torch.tensor(float(h.shape[0]))),
         "foff_rate": (((gs + h < C * (1 - tol)).float() * off).sum(), off.sum()),
     }
+    fx = (gs + h - C) / scale                                 # predicted detour  f^ - C*  (units of C*)
+    fy = (gs + hs - C) / scale                                # true detour d*
+    n_l = lab.flatten(1).sum(1).clamp(min=1.0)
+    mx, my = (fx * lab).flatten(1).sum(1) / n_l, (fy * lab).flatten(1).sum(1) / n_l
+    dx, dy = (fx - mx.view(-1, 1, 1, 1)) * lab, (fy - my.view(-1, 1, 1, 1)) * lab
+    corr = (dx * dy).flatten(1).sum(1) / ((dx ** 2).flatten(1).sum(1) * (dy ** 2).flatten(1).sum(1)).sqrt().clamp(min=1e-9)
+    ok = (lab.flatten(1).sum(1) > 2).float()
+    s["f_on"] = ((fx.abs() * on).sum(), on.sum())
+    s["f_corr"] = ((corr * ok).sum(), ok.sum())
     viol, edges = 0.0, 0.0
     for dr, dc in NEIGHBORS:
         edge = free * shifted(free, dr, dc)
@@ -556,8 +697,9 @@ def train_member(k, train_ds, val_loader, args, w, device):
     H = train_ds[0]["free"].shape[-1]
     assert H % (2 ** args.depth) == 0, f"map size {H} must be divisible by 2**depth = {2 ** args.depth}"
     cfg = {"width": member_width(k, args), "depth": args.depth, "h_scale": args.h_scale or H / 2.0,
-           "input_mode": args.input_mode}
-    model = HeuristicNet(**cfg).to(device)
+           "input_mode": args.input_mode, "refine_iters": args.refine_iters, "head": args.head,
+           "ratio_span": args.ratio_span, "scale_feat": not args.no_scale_feat}
+    model = HeuristicNet(**cfg, out_bias=args.out_bias).to(device)
     ds = train_ds
     if args.bootstrap:                                       # bagging: every member sees a different resample
         rng = np.random.default_rng(args.seed + 1000 * k)
@@ -574,7 +716,7 @@ def train_member(k, train_ds, val_loader, args, w, device):
           f"{len(ds)} training maps ===")
     log_path = os.path.join(args.out_dir, f"log_member_{k}.csv")
     cols = ["epoch", "train_loss", "val_loss", "val_over_rate_on", "val_over_mean_on", "val_tight_on",
-            "val_cons_viol_rate", "val_goal_abs", "val_foff_rate"]
+            "val_cons_viol_rate", "val_goal_abs", "val_foff_rate", "val_f_on", "val_f_corr", "val_tight_lab"]
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow(cols)
     best = math.inf
@@ -595,12 +737,14 @@ def train_member(k, train_ds, val_loader, args, w, device):
         val = eval_on_loader(lambda b: model(b["free"], b["start"], b["goal"], b["phi"]), val_loader, device, w,
                              args.huber_delta)
         print(f"  epoch {epoch:3d} | train {run / seen:.4f} | val {val['loss']:.4f} | over(path) "
-              f"{val['over_rate_on'] * 100:5.1f}% | tight(path) {val['tight_on']:.3f} | cons-viol "
+              f"{val['over_rate_on'] * 100:5.1f}% | tight(path) {val['tight_on']:.3f} | tight(all) {val['tight_lab']:.3f} | cons-viol "
               f"{val['cons_viol_rate'] * 100:5.2f}% | goal {val['goal_abs']:.4f} | f<C* off-path "
-              f"{val['foff_rate'] * 100:5.1f}% | {time.time() - t0:.0f}s", flush=True)
+              f"{val['foff_rate'] * 100:5.1f}% | f_on {val['f_on']:.3f} | f_corr {val['f_corr']:.3f} | "
+              f"{time.time() - t0:.0f}s", flush=True)
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([epoch, run / seen, val["loss"], val["over_rate_on"], val["over_mean_on"],
-                                    val["tight_on"], val["cons_viol_rate"], val["goal_abs"], val["foff_rate"]])
+                                    val["tight_on"], val["cons_viol_rate"], val["goal_abs"], val["foff_rate"],
+                                    val["f_on"], val["f_corr"], val["tight_lab"]])
         if val["loss"] < best:
             best = val["loss"]
             torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val": val},
@@ -642,13 +786,52 @@ def evaluate_ensemble(nets, ds, device, args, w):
     cand["zero (Dijkstra)"] = lambda b: torch.zeros_like(b["free"])
     res = {name: eval_on_loader(fn, loader, device, w, args.huber_delta) for name, fn in cand.items()}
     print(f"\n{'heuristic':24s} {'over%(path)':>11s} {'over mean':>10s} {'tight(path)':>11s} {'cons-viol%':>10s} "
-          f"{'|h(goal)|':>10s} {'f<C* off%':>10s}")
+          f"{'|h(goal)|':>10s} {'f<C* off%':>10s} {'f_on':>7s} {'f_corr':>7s}")
     for name, r in res.items():
         print(f"{name:24s} {r['over_rate_on'] * 100:11.2f} {r['over_mean_on']:10.4f} {r['tight_on']:11.3f} "
-              f"{r['cons_viol_rate'] * 100:10.2f} {r['goal_abs']:10.4f} {r['foff_rate'] * 100:10.1f}")
+              f"{r['cons_viol_rate'] * 100:10.2f} {r['goal_abs']:10.4f} {r['foff_rate'] * 100:10.1f} "
+              f"{r['f_on']:7.3f} {r['f_corr']:7.3f}")
     print("(over%: path cells with h > h* by more than 0.5% of C*; tight: mean h/h* on path cells, 1 = exact; "
-          "f<C* off%: off-path cells A* would still expand)")
+          "f<C* off%: off-path cells A* would still expand; f_on: mean |f^-C*|/C* on path cells, 0 = path has the lowest f; "
+          "f_corr: correlation of the predicted and true detour map, 1 = identical)")
     return res
+
+
+@torch.no_grad()
+def calibration_report(nets, ds, device, args):
+    """mean h/h* (and mean h, mean h*) on labelled cells, binned by Chebyshev distance to the goal / map width."""
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+    edges = [0.0, 0.1, 0.25, 0.5, 1.01]
+    nb = len(edges) - 1
+    names = [f"member_{k}" for k in range(len(nets))] + ["ens_mean"]
+    acc = {n: np.zeros((nb, 2)) for n in names}               # sum(h/h*), count
+    sh, shs, cnt = np.zeros(nb), np.zeros(nb), np.zeros(nb)   # ens_mean h, h*, count
+    for b in loader:
+        b = {k: v.to(device) for k, v in b.items()}
+        H_all = ensemble_predict(nets, b["free"], b["start"], b["goal"], b["phi"])
+        preds = {n: H_all[k] for k, n in enumerate(names[:-1])}
+        preds["ens_mean"] = H_all.mean(0)
+        hs, lab = b["h_star"], b["lab"]
+        dist = cheb_dist(b["goal"]) / b["free"].shape[-1]
+        m = lab * (hs > 1e-3).float()
+        for j in range(nb):
+            mj = m * ((dist >= edges[j]) & (dist < edges[j + 1])).float()
+            cnt[j] += mj.sum().item()
+            shs[j] += (hs * mj).sum().item()
+            sh[j] += (preds["ens_mean"] * mj).sum().item()
+            for n in names:
+                acc[n][j] += [(preds[n] / hs.clamp(min=1e-3) * mj).sum().item(), mj.sum().item()]
+    head = "  ".join(f"[{edges[j]:.2f},{min(edges[j + 1], 1):.2f})" for j in range(nb))
+    print(f"\ncalibration, distance-to-goal / map width bins   {head}")
+    print(f"{'mean h*':24s} " + "  ".join(f"{shs[j] / max(cnt[j], 1):11.2f}" for j in range(nb)))
+    print(f"{'mean h (ens_mean)':24s} " + "  ".join(f"{sh[j] / max(cnt[j], 1):11.2f}" for j in range(nb)))
+    out = {}
+    for n in names:
+        row = [acc[n][j, 0] / max(acc[n][j, 1], 1) for j in range(nb)]
+        out[n] = row
+        print(f"{'h/h* ' + n:24s} " + "  ".join(f"{x:11.3f}" for x in row))
+    print("(1.000 = calibrated; <1 conservative, >1 overestimates; a ratio drifting with distance means the scale is wrong)")
+    return out
 
 
 @torch.no_grad()
@@ -743,6 +926,39 @@ def visualize(nets, ds, device, out_dir, indices):
     p2 = os.path.join(out_dir, "ensemble_errors.png")
     fig.savefig(p2, dpi=110)
     plt.close(fig)
+    gs = b["g_star"][:, 0].cpu().numpy()
+    Cn = b["C"].cpu().numpy()
+    Hm = H_all.mean(0)
+    fig, ax = plt.subplots(n, 3 + K, figsize=(2.6 * (3 + K), 2.6 * n), squeeze=False)
+    for r in range(n):
+        s = np.unravel_index(b["start"][r, 0].argmax().item(), (H, W))
+        g = np.unravel_index(b["goal"][r, 0].argmax().item(), (H, W))
+        img = np.where(free[r][..., None] > 0.5, 0.85, 0.0) * np.ones((H, W, 3))
+        img[s], img[g] = (0, 0.8, 0), (1, 0, 0)
+        m = lab[r] > 0.5
+        true_d = gs[r] + hs[r] - Cn[r]
+        vmax = float(np.percentile(true_d[m], 99)) if m.any() else 1.0
+        ax[r, 0].imshow(img)
+        ax[r, 1].imshow(np.where(m, true_d, nan), cmap=cmap, vmin=0, vmax=vmax)
+        preds = [("ensemble mean", Hm[r])] + [(f"member {k}", H_all[k, r]) for k in range(K)]
+        for j, (nm, hv) in enumerate(preds):
+            pred_d = gs[r] + hv - Cn[r]
+            cc = float(np.corrcoef(pred_d[m], true_d[m])[0, 1]) if m.sum() > 2 else float("nan")
+            ax[r, 2 + j].imshow(np.where(m, pred_d, nan), cmap=cmap, vmin=0, vmax=vmax)
+            if r == 0:
+                ax[r, 2 + j].set_title(f"{nm}\nf^-C*  (corr {cc:.2f})", fontsize=7)
+            else:
+                ax[r, 2 + j].set_title(f"corr {cc:.2f}", fontsize=7)
+        if r == 0:
+            ax[r, 0].set_title("map (S green, G red)", fontsize=8)
+            ax[r, 1].set_title("true detour g*+h*-C*\n(0 on shortest path)", fontsize=8)
+        for j in range(3 + K):
+            ax[r, j].axis("off")
+    fig.tight_layout()
+    p3 = os.path.join(out_dir, "ensemble_detour.png")
+    fig.savefig(p3, dpi=110)
+    plt.close(fig)
+    print(f"saved {p3}")
     np.savez_compressed(os.path.join(out_dir, "inspect_outputs.npz"), h=H_all, h_star=hs, phi=phi, free=free,
                         on=on, lab=lab, indices=np.array(indices))
     print(f"saved {p1}\nsaved {p2}\nsaved {os.path.join(out_dir, 'inspect_outputs.npz')} "
@@ -752,6 +968,16 @@ def visualize(nets, ds, device, out_dir, indices):
 # ======================================================================================
 # 10. Main
 # ======================================================================================
+PRESETS = {
+    # f-landscape (detour) training: balanced asymmetry, strong two-sided fit near the shortest path, propagation block
+    "detour": dict(w_over_on=1.0, w_over_off=1.0, w_under=1.0, w_cons=1.0, w_goal=10.0, w_foff=2.0, w_fit=5.0,
+                   w_logfit=1.0, refine_iters=24, out_bias=-2.0),
+    # the original conservative (admissible-ish) training
+    "admissible": dict(w_over_on=20.0, w_over_off=2.0, w_under=1.0, w_cons=10.0, w_goal=10.0, w_foff=2.0, w_fit=0.0,
+                       w_logfit=0.0, refine_iters=0, out_bias=-4.0),
+}
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Ensemble of heuristic CNNs for A* under learned (Phi) step costs")
     p.add_argument("--mode", choices=["train", "inspect"], default="train")
@@ -765,8 +991,9 @@ def parse_args():
     p.add_argument("--color-tol", type=int, default=60)
     p.add_argument("--phi-checkpoint", default=None, help="trained Neural A* checkpoint (best.pt / last.pt)")
     p.add_argument("--phi-const", type=float, default=None, help="use a constant Phi instead of a checkpoint")
-    p.add_argument("--input-mode", choices=["full", "rgb"], default="full",
-                   help="full: 6 input channels (incl. Phi and distance maps); rgb: only goal/start/free (R/G/B)")
+    p.add_argument("--input-mode", choices=["full", "rgb", "minimal"], default="full",
+                   help="full: 6 (+4 scale) input channels incl. Phi and distance maps; minimal: 4 channels "
+                        "(free, start, goal, Phi); rgb: only goal/start/free (R/G/B)")
     p.add_argument("--target", choices=["dijkstra", "given-path"], default="dijkstra")
     p.add_argument("--n-members", type=int, default=5)
     p.add_argument("--epochs", type=int, default=30)
@@ -775,17 +1002,30 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--width", type=int, default=32)
     p.add_argument("--depth", type=int, default=4)
-    p.add_argument("--h-scale", type=float, default=None, help="scale of the learned residual (default W/2)")
+    p.add_argument("--h-scale", type=float, default=None, help="scale of the additive branch (default: data-driven for --head ratio, W/2 otherwise)")
     p.add_argument("--vary-width", action="store_true", help="members get widths 0.75x / 1x / 1.5x in turn")
     p.add_argument("--bootstrap", action="store_true", help="each member trains on a bootstrap resample")
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--huber-delta", type=float, default=0.02)
-    p.add_argument("--w-over-on", type=float, default=20.0, help="h > h* on path cells (strong)")
-    p.add_argument("--w-over-off", type=float, default=2.0, help="h > h* on off-path cells")
-    p.add_argument("--w-under", type=float, default=1.0, help="h < h* (weak)")
-    p.add_argument("--w-cons", type=float, default=10.0, help="consistency hinge")
-    p.add_argument("--w-goal", type=float, default=10.0, help="h(goal) != 0")
-    p.add_argument("--w-foff", type=float, default=2.0, help="off-path cells with f = g* + h < C*")
+    p.add_argument("--preset", choices=list(PRESETS), default="detour",
+                   help="default values of all the options marked [preset] below")
+    p.add_argument("--w-over-on", type=float, default=None, help="[preset] h > h* on path cells")
+    p.add_argument("--w-over-off", type=float, default=None, help="[preset] h > h* on off-path cells")
+    p.add_argument("--w-under", type=float, default=None, help="[preset] h < h*")
+    p.add_argument("--w-cons", type=float, default=None, help="[preset] consistency hinge")
+    p.add_argument("--w-goal", type=float, default=None, help="[preset] h(goal) != 0")
+    p.add_argument("--w-foff", type=float, default=None, help="[preset] off-path cells with f = g* + h < C*")
+    p.add_argument("--w-fit", type=float, default=None, help="[preset] two-sided fit weighted towards the shortest path")
+    p.add_argument("--w-logfit", type=float, default=None, help="[preset] log-ratio (relative error) loss on labelled cells")
+    p.add_argument("--head", choices=["ratio", "additive"], default="ratio",
+                   help="ratio: h = Cheb * cost-per-step + small additive detour branch; additive: old c_min*Cheb + residual")
+    p.add_argument("--ratio-span", type=float, default=4.0,
+                   help="ratio head: cost per step can rise from c_min up to ~ c_min + span * c_mean")
+    p.add_argument("--no-scale-feat", action="store_true", help="do not add the 4 Phi-scale input channels (full mode)")
+    p.add_argument("--band-tau", type=float, default=0.05, help="fit weight exp(-detour / tau), detour in units of C*")
+    p.add_argument("--band-floor", type=float, default=0.1, help="minimum fit weight of far-away labelled cells")
+    p.add_argument("--refine-iters", type=int, default=None, help="[preset] masked propagation steps after the U-Net")
+    p.add_argument("--out-bias", type=float, default=None, help="[preset] initial bias of the output layer")
     p.add_argument("--eval-search", type=int, default=100, help="maps used for the real A* comparison (0 = skip)")
     p.add_argument("--workers", type=int, default=4, help="processes for the Dijkstra targets")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
@@ -795,6 +1035,9 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+    for k, v in PRESETS[args.preset].items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
     if args.input_mode == "rgb" and args.phi_checkpoint is None and args.phi_const is None:
         args.phi_const = 1.0                      # rgb heuristics do not see Phi: default to plain shortest-path targets
     if args.phi_checkpoint is None and args.phi_const is None:
@@ -810,6 +1053,7 @@ def parse_args():
 def run_full_eval(nets, d, name, args, device, w, out):
     ds = HeuristicDataset(d, augment=False)
     out[f"{name}_constraints"] = evaluate_ensemble(nets, ds, device, args, w)
+    out[f"{name}_calibration"] = calibration_report(nets, ds, device, args)
     if args.eval_search > 0:
         out[f"{name}_search"] = evaluate_search(nets, ds, device, args.eval_search)
     return ds
@@ -820,7 +1064,8 @@ def main():
     device = torch.device(args.device)
     os.makedirs(args.out_dir, exist_ok=True)
     w = {"over_on": args.w_over_on, "over_off": args.w_over_off, "under": args.w_under, "cons": args.w_cons,
-         "goal": args.w_goal, "foff": args.w_foff}
+         "goal": args.w_goal, "foff": args.w_foff, "fit": args.w_fit, "band_tau": args.band_tau,
+         "band_floor": args.band_floor, "logfit": args.w_logfit}
 
     val_d = prepare_split("val", load_dataset(args.val_data, args), args, device)
     if args.mode == "inspect":
@@ -833,10 +1078,14 @@ def main():
     train_d = prepare_split("train", load_dataset(args.train_data, args), args, device)
     report_targets("train", train_d, args.target)
     report_targets("val", val_d, args.target)
+    report_scale("train", train_d)
+    if args.h_scale is None and args.head == "ratio":
+        args.h_scale = auto_h_scale(train_d)
+        print(f"[train] h_scale for the additive detour branch set from the data: {args.h_scale:.2f}")
     train_ds = HeuristicDataset(train_d, augment=not args.no_augment)
     val_loader = DataLoader(HeuristicDataset(val_d, augment=False), batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers)
-    print(f"\ntraining {args.n_members} members | loss weights {w} | augmentation "
+    print(f"\ntraining {args.n_members} members | preset {args.preset} | head {args.head} | refine-iters {args.refine_iters} | loss weights {w} | augmentation "
           f"{'off' if args.no_augment else 'on'} | target {args.target}")
     for k in range(args.n_members):
         train_member(k, train_ds, val_loader, args, w, device)
