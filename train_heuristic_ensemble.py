@@ -991,7 +991,7 @@ def parse_args():
     p.add_argument("--color-tol", type=int, default=60)
     p.add_argument("--phi-checkpoint", default=None, help="trained Neural A* checkpoint (best.pt / last.pt)")
     p.add_argument("--phi-const", type=float, default=None, help="use a constant Phi instead of a checkpoint")
-    p.add_argument("--input-mode", choices=["full", "rgb", "minimal"], default="full",
+    p.add_argument("--input-mode", choices=["full", "rgb", "minimal"], default="minimal",
                    help="full: 6 (+4 scale) input channels incl. Phi and distance maps; minimal: 4 channels "
                         "(free, start, goal, Phi); rgb: only goal/start/free (R/G/B)")
     p.add_argument("--target", choices=["dijkstra", "given-path"], default="dijkstra")
