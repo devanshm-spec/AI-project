@@ -3,9 +3,10 @@ Stochastic multi-CNN-heuristic A* on 64x64 maps (maps from make_synthetic_data.p
 with the Chebyshev and Euclidean heuristics on the same maps.
 
 WEIGHTS: the member_*.pt files written by train_heuristic_ensemble.py in --weights-dir ({"model", "config"} with
-    config = width / depth / h_scale / input_mode).  The network class (HeuristicNet) is copied into this file, so
+    config = width / depth / h_scale / input_mode / refine_iters / head / ratio_span / scale_feat).  The network class (HeuristicNet) is copied into this file, so
     train_heuristic_ensemble.py is not needed at run time.  The nets output h in cell units
-    (h = Chebyshev + h_scale * softplus(z), zero on obstacles).
+    (ratio head: h = Cheb * (c_min + span * c_mean * softplus(z1)) + h_scale * softplus(z2) * (1 - goal), zero on obstacles;
+    additive head: h = c_min * Cheb + h_scale * softplus(z)).
 
 BEFORE THE SEARCH (once per map)
     The map is turned into the RGB input  R = goal (one-hot), G = start (one-hot), B = free cells  and passed through
@@ -118,41 +119,94 @@ def conv_block(i, o):
 
 
 class HeuristicUNet(nn.Module):
-    def __init__(self, in_ch, width, depth):
+    def __init__(self, in_ch, width, depth, refine_iters=0, out_bias=-4.0, out_ch=1):
         super().__init__()
+        self.refine_iters = refine_iters
         ch = [width * 2 ** i for i in range(depth + 1)]
         self.enc = nn.ModuleList([conv_block(in_ch, ch[0])] + [conv_block(ch[i], ch[i + 1]) for i in range(depth)])
         self.up = nn.ModuleList([nn.ConvTranspose2d(ch[i + 1], ch[i], 2, stride=2) for i in reversed(range(depth))])
         self.dec = nn.ModuleList([conv_block(2 * ch[i], ch[i]) for i in reversed(range(depth))])
-        self.out = nn.Conv2d(ch[0], 1, 1)
+        self.out = nn.Conv2d(ch[0], out_ch, 1)
+        nn.init.constant_(self.out.bias, out_bias)         # -4: start at the analytic lower bound
+        if out_ch > 1:                                     # 2nd (additive detour) branch starts even closer to zero
+            with torch.no_grad():
+                self.out.bias[1:] = out_bias - 3.0
+        if refine_iters > 0:                               # shared residual step, starts as the identity
+            self.prop = nn.Sequential(nn.Conv2d(ch[0], ch[0], 3, padding=1), nn.ReLU(inplace=True),
+                                      nn.Conv2d(ch[0], ch[0], 3, padding=1))
+            nn.init.zeros_(self.prop[2].weight)
+            nn.init.zeros_(self.prop[2].bias)
 
-    def forward(self, x):
+    def forward(self, x, free=None):
         feats = [self.enc[0](x)]
         for e in self.enc[1:]:
             feats.append(e(F.max_pool2d(feats[-1], 2)))
         h = feats[-1]
         for up, dec, skip in zip(self.up, self.dec, reversed(feats[:-1])):
             h = dec(torch.cat([skip, up(h)], dim=1))
+        if self.refine_iters > 0:                          # information only moves between free cells
+            for _ in range(self.refine_iters):
+                h = (h + self.prop(h)) * free
         return self.out(h)
 
 
+def masked_avg(phi, free, k):
+    """Average of phi over the free cells of a k x k window (k odd), zero on obstacles."""
+    num = F.avg_pool2d(phi * free, k, 1, k // 2, count_include_pad=False)
+    den = F.avg_pool2d(free, k, 1, k // 2, count_include_pad=False)
+    return num / den.clamp(min=1e-3) * free
+
+
 class HeuristicNet(nn.Module):
-    def __init__(self, width=32, depth=4, h_scale=32.0, input_mode="full"):
+    """h(v) >= 0 for one (map, start, goal, Phi) problem; zero on obstacles.
+
+    input_mode "full": input [free, start, goal, cheb-to-start, cheb-to-goal, Phi*free (+4 scale channels)], lower bound c_min*Cheb.
+    input_mode "minimal": input [free, start, goal, Phi*free] (4 channels, no distance or scale channels); the ratio head
+                       still gets Cheb(v, goal), c_min and c_mean outside the network.
+    input_mode "rgb" : input [goal (R), start (G), free (B)] only (3 channels); Phi is ignored by the network and the
+                       analytic lower bound is the unit-cost Chebyshev distance.
+    head "ratio"     : h = Cheb * (c_min + ratio_span * c_mean * softplus(z1)) + h_scale * softplus(z2) * (1 - goal)
+    head "additive"  : h = lower bound + h_scale * softplus(z)          (original behaviour; default for old checkpoints)"""
+
+    N_SCALE_CH = 4
+
+    def __init__(self, width=32, depth=4, h_scale=32.0, input_mode="full", refine_iters=0, out_bias=-4.0,
+                 head="additive", ratio_span=4.0, scale_feat=False):
         super().__init__()
-        assert input_mode in ("full", "rgb"), "input_mode must be 'full' or 'rgb'"
-        self.input_mode = input_mode
-        self.body = HeuristicUNet(3 if input_mode == "rgb" else 6, width, depth)
+        assert input_mode in ("full", "rgb", "minimal"), "input_mode must be 'full', 'rgb' or 'minimal'"
+        assert head in ("ratio", "additive"), "head must be 'ratio' or 'additive'"
+        self.input_mode, self.head, self.ratio_span = input_mode, head, ratio_span
+        self.scale_feat = bool(scale_feat) and input_mode == "full"
+        in_ch = {"rgb": 3, "minimal": 4}.get(input_mode, 6 + (self.N_SCALE_CH if self.scale_feat else 0))
+        self.body = HeuristicUNet(in_ch, width, depth, refine_iters, out_bias, out_ch=2 if head == "ratio" else 1)
         self.h_scale = h_scale
 
     def forward(self, free, start, goal, phi):
         W = free.shape[-1]
+        cheb_g = cheb_dist(goal)
         if self.input_mode == "rgb":
-            x = torch.cat([goal, start, free], dim=1)           # R = goal, G = start, B = free
-            lb = cheb_dist(goal) * free
+            x = torch.cat([goal, start, free], dim=1)
+            cmin = cmean = torch.ones(free.shape[0], 1, 1, 1, device=free.device, dtype=free.dtype)
+            lb = cheb_g * free
         else:
-            x = torch.cat([free, start, goal, cheb_dist(start) / W, cheb_dist(goal) / W, phi * free], dim=1)
-            lb = lower_bound(free, goal, phi)
-        return (lb + self.h_scale * F.softplus(self.body(x))) * free
+            cmin = (phi + (1.0 - free) * 1e3).amin(dim=(1, 2, 3), keepdim=True)
+            cmean = (phi * free).sum(dim=(1, 2, 3), keepdim=True) / free.sum(dim=(1, 2, 3), keepdim=True).clamp(min=1.0)
+            if self.input_mode == "minimal":
+                chans = [free, start, goal, phi * free]
+            else:
+                chans = [free, start, goal, cheb_dist(start) / W, cheb_g / W, phi * free]
+            if self.scale_feat:
+                chans += [masked_avg(phi, free, 5), masked_avg(phi, free, 15),
+                          cmean * cheb_g / W * free, cmin * cheb_g / W * free]
+            x = torch.cat(chans, dim=1)
+            lb = cmin * cheb_g * free
+        z = self.body(x, free)
+        if self.head == "ratio":
+            rho = cmin + self.ratio_span * cmean * F.softplus(z[:, :1])          # cost per Chebyshev step, >= c_min
+            h = cheb_g * rho + self.h_scale * F.softplus(z[:, 1:2]) * (1.0 - goal)
+        else:
+            h = lb + self.h_scale * F.softplus(z)
+        return h * free
 
 
 def load_ensemble(weights_dir, n, device):
