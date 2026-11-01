@@ -1,6 +1,14 @@
 """
-Stochastic multi-CNN-heuristic A* on 64x64 maps (maps from make_synthetic_data.py), compared against plain A*
-with the Chebyshev and Euclidean heuristics on the same maps.
+Stochastic multi-CNN-heuristic A* on 64x64 maps (maps from make_synthetic_data.py), compared against NORMAL
+(deterministic) A* that uses the SAME CNN-mean heuristic and the SAME step costs.  Chebyshev / Euclidean are no longer used.
+
+COMPARISON (per map, both searches see exactly the same h_mean and the same cost matrix)
+    1. A* (CNN mean h)      textbook A*:  f = g + h_mean, always expands the lowest f (no randomness, no exploration bonus,
+                            no std).  Closed nodes are not re-opened unless --astar-reopen is given.
+    2. stochastic CNN A*    the stochastic search described below.
+    Reference only (not a competitor): Dijkstra (h = 0) on the same costs gives the optimal path cost C* and how many nodes a
+    search with no heuristic needs, so every path cost is reported as a multiple of C* and the CNN saving is visible.
+    The step cost is 1 per step (--g-mode const) or Phi (--g-mode guidance) for ALL searches, so the comparison is like for like.
 
 WEIGHTS: the member_*.pt files written by train_heuristic_ensemble.py in --weights-dir ({"model", "config"} with
     config = width / depth / h_scale / input_mode / refine_iters / head / ratio_span / scale_feat).  The network class (HeuristicNet) is copied into this file, so
@@ -45,10 +53,10 @@ REF_STD (sigma at which K = S/2), in this order of priority
     (neither)                   fall back to the per-map mean of h_std over free cells
 
 OUTPUT (all under --out-dir)
-    examples/sample_XXXX/   overview.png (all panels) + search_ours.png, search_astar_chebyshev.png,
-                            search_astar_euclidean.png, heatmap_h_mean.png, heatmap_h_std.png,
+    examples/sample_XXXX/   overview.png (all panels) + search_ours.png, search_astar_cnn.png,
+                            heatmap_h_mean.png, heatmap_h_std.png,
                             heatmap_guidance.png (guidance map Phi), h_over_iterations.png, description.txt
-    scatter/                scatter_nodes.png (x = plain A* nodes, y = ours; Chebyshev and Euclidean)
+    scatter/                scatter_nodes.png (x = A* with CNN mean h, y = stochastic CNN A*)
     tables/                 summary.csv, summary.json, report.txt (all example descriptions + aggregate stats)
 
 USAGE
@@ -58,9 +66,11 @@ USAGE
 NOTES
     * "full" input-mode nets also take Phi as input: it is the guidance map when --phi-checkpoint is given,
       otherwise a constant --phi-const (default 1; use the value the nets were trained with).
-    * the plain A* baselines (Chebyshev / Euclidean) ALWAYS use the constant cost matrix g = 1 per step, never the
-      guidance map; only our stochastic search uses Phi (with --g-mode guidance).  Path lengths are reported in cells,
-      and "optimal" is the unit-cost shortest path, so with guidance our path can legitimately be longer than optimal.
+    * all searches (A* with CNN h, stochastic CNN A*, Dijkstra reference) use the same step cost: 1 per step with
+      --g-mode const, Phi with --g-mode guidance.  Path lengths are reported in cells AND as path cost relative to the
+      optimal cost C* (Dijkstra); with guidance the cheapest path can legitimately have more cells than the unit-cost one.
+    * the CNN heuristic is not guaranteed admissible, so A* (CNN mean h) can return a path costlier than C*; look at the
+      "x opt" column.  --astar-reopen lets A* re-open closed nodes (as the stochastic search does).
 """
 import argparse
 import csv
@@ -385,29 +395,29 @@ def stochastic_astar(free, start, goal, h, h_std, cost, c_b, ref_std, rank_power
                   {k: np.array(v) for k, v in hist.items()}, reopened)
 
 
-def heuristic_map(shape, goal, kind):
-    H, W = shape
-    dr = np.abs(np.arange(H)[:, None] - goal[0]) * np.ones((1, W))
-    dc = np.abs(np.arange(W)[None, :] - goal[1]) * np.ones((H, 1))
-    return np.maximum(dr, dc) if kind == "chebyshev" else np.sqrt(dr ** 2 + dc ** 2)
+def path_cost(path, cost):
+    """Sum of the step costs of the cells entered along the path (start excluded)."""
+    return float(sum(cost[r, c] for r, c in path[1:]))
 
 
-def plain_astar(free, start, goal, kind, cost=None):
+def astar(free, start, goal, hm, cost, name="A* (CNN mean h)", reopen=False):
     """Textbook A*, 8 neighbours, corner cutting allowed (same grid as the data generator).
-    g uses the CONSTANT cost matrix of 1 (never the guidance map Phi): this is the generic A* reference.
-    The Chebyshev / Euclidean heuristics are only meaningful for unit costs, so `cost` should stay None."""
+    f = g + hm, g accumulates `cost` (cost of entering a cell), ties broken by smaller h.
+    hm = CNN mean heuristic for the comparison, zeros for the Dijkstra reference.
+    reopen=False: classic closed list (a closed node is never expanded again); True: a closed node reached by a cheaper
+    route is re-expanded (needed for optimality when h is not consistent)."""
     H, W = free.shape
-    if cost is None:
-        cost = np.ones((H, W))
     t0 = time.perf_counter()
-    hm = heuristic_map(free.shape, goal, kind)
-    g = {start: 0}
+    g = {start: 0.0}
     parent = {start: None}
     heap = [(hm[start], hm[start], start)]
     closed, expanded, found = set(), [], False
     while heap:
-        _, _, n = heapq.heappop(heap)
-        if n in closed:
+        f, _, n = heapq.heappop(heap)
+        if reopen:
+            if f > g[n] + hm[n] + 1e-12:                  # stale heap entry (a cheaper route to n was found later)
+                continue
+        elif n in closed:
             continue
         closed.add(n)
         expanded.append(n)
@@ -416,15 +426,15 @@ def plain_astar(free, start, goal, kind, cost=None):
             break
         for dr, dc in NEIGHBORS:
             m = (n[0] + dr, n[1] + dc)
-            if 0 <= m[0] < H and 0 <= m[1] < W and free[m] and m not in closed:
+            if 0 <= m[0] < H and 0 <= m[1] < W and free[m] and (reopen or m not in closed):
                 ng = g[n] + cost[m]
-                if ng < g.get(m, math.inf):
+                if ng < g.get(m, math.inf) - 1e-12:
                     g[m], parent[m] = ng, n
                     heapq.heappush(heap, (ng + hm[m], hm[m], m))
     dt = time.perf_counter() - t0
     open_final = [k for k in g if k not in closed]
-    return Result(f"A* {kind} (g=1)", found, backtrack(parent, goal) if found else [], expanded, len(g), dt,
-                  open_final, parent)
+    return Result(name, found, backtrack(parent, goal) if found else [], expanded, len(g), dt,
+                  open_final, parent, reopened=len(expanded) - len(set(expanded)))
 
 
 # ======================================================================================
@@ -478,44 +488,48 @@ def draw_hist(ax, res):
     ax.set_title("h values per iteration", fontsize=8)
 
 
-def describe(i, d, free, start, goal, ours, cheb, euc, h_mean, h_std, ref_std, t_cnn, opt_len, n_nets, metric):
-    def plen(r):
-        if not r.found:
-            return "not found"
-        return f"{r.path_len} (optimal)" if r.path_len <= opt_len else f"{r.path_len} (+{r.path_len - opt_len})"
-
+def describe(i, free, start, goal, ours, base, dij, h_mean, h_std, ref_std, t_cnn, opt_len, opt_cost, n_nets, metric, cost):
     key = (lambda r: r.n_expanded) if metric == "expanded" else (lambda r: r.discovered)
 
-    def change(r):
-        pct = (1 - key(ours) / key(r)) * 100
-        return f"{abs(pct):.0f}% {'fewer' if pct >= 0 else 'more'} nodes than {r.name}"
+    def pcost(r):
+        if not r.found:
+            return "not found"
+        c = path_cost(r.path, cost)
+        return f"{c:.2f} ({c / opt_cost:.3f}x)"
+
+    def change(a, b):
+        pct = (1 - key(a) / key(b)) * 100
+        return f"{abs(pct):.0f}% {'fewer' if pct >= 0 else 'more'} nodes than {b.name}"
 
     L = [f"=== Sample {i} ===",
          f"Map {free.shape[0]}x{free.shape[1]}, {free.mean() * 100:.0f}% free | start {tuple(start)} -> goal {tuple(goal)} "
-         f"| shortest path {opt_len} cells",
+         f"| shortest path {opt_len} cells, optimal cost C* = {opt_cost:.2f}",
          "",
-         f"{'Method':<22}{'Expanded':>9}{'Opened':>8}{'Path length':>17}{'Time (ms)':>11}"]
-    for name, r in (("Stochastic CNN A*", ours), ("A* Chebyshev", cheb), ("A* Euclidean", euc)):
-        L.append(f"{name:<22}{r.n_expanded:>9}{r.discovered:>8}{plen(r):>17}{r.time * 1e3:>11.1f}")
+         f"{'Method':<22}{'Expanded':>9}{'Opened':>8}{'Cells':>7}{'Path cost (x C*)':>20}{'Time (ms)':>11}"]
+    for name, r in (("Stochastic CNN A*", ours), ("A* (CNN mean h)", base), ("Dijkstra (h=0, ref.)", dij)):
+        L.append(f"{name:<22}{r.n_expanded:>9}{r.discovered:>8}{(r.path_len if r.found else 0):>7}"
+                 f"{pcost(r):>20}{r.time * 1e3:>11.1f}")
     L += ["",
-          f"Result: ours used {change(cheb)}, and {change(euc)}."]
+          f"Result: stochastic CNN A* used {change(ours, base)}; A* (CNN mean h) used {change(base, dij)}."]
     h = ours.hist
-    extra = f"plain A* runs use g = 1 per step (no guidance map); {n_nets} CNNs (inference {t_cnn * 1e3:.0f} ms, not counted in the times)"
+    extra = (f"all searches use the same step costs and the same h_mean; {n_nets} CNNs "
+             f"(inference {t_cnn * 1e3:.0f} ms, not counted in the times)")
     if len(h.get("K", [])):
-        extra += f"; avg {h['K'].mean():.1f} candidates picked from {h['S'].mean():.1f} open nodes"
+        extra += f"; stochastic: avg {h['K'].mean():.1f} candidates picked from {h['S'].mean():.1f} open nodes"
         if ours.reopened:
-            extra += f"; {ours.reopened} nodes re-opened"
+            extra += f", {ours.reopened} nodes re-opened"
+    if base.reopened:
+        extra += f"; A*: {base.reopened} re-expansions"
     L.append(f"Notes: {extra}.")
     L.append("(Expanded = nodes taken out of the open list; Opened = nodes that ever entered it.)")
     return "\n".join(L)
 
 
-def save_example(i, root, free, start, goal, ours, cheb, euc, h_mean, h_std, text, phi, phi_title):
+def save_example(i, root, free, start, goal, ours, base, h_mean, h_std, text, phi, phi_title):
     d = os.path.join(root, f"sample_{i:04d}")
     os.makedirs(d, exist_ok=True)
     singles = [("search_ours.png", lambda a, f: draw_search(a, free, start, goal, ours, graph=True)),
-               ("search_astar_chebyshev.png", lambda a, f: draw_search(a, free, start, goal, cheb)),
-               ("search_astar_euclidean.png", lambda a, f: draw_search(a, free, start, goal, euc)),
+               ("search_astar_cnn.png", lambda a, f: draw_search(a, free, start, goal, base)),
                ("heatmap_h_mean.png", lambda a, f: draw_heat(a, f, h_mean, free, start, goal, "mean h of the CNNs")),
                ("heatmap_h_std.png", lambda a, f: draw_heat(a, f, h_std, free, start, goal, "std of h across the CNNs")),
                ("heatmap_guidance.png", lambda a, f: draw_heat(a, f, phi, free, start, goal, phi_title)),
@@ -524,11 +538,8 @@ def save_example(i, root, free, start, goal, ours, cheb, euc, h_mean, h_std, tex
         fig, ax = plt.subplots(figsize=(6.5, 6) if name != "h_over_iterations.png" else (7, 4))
         fn(ax, fig)
         fig.tight_layout(); fig.savefig(os.path.join(d, name), dpi=130); plt.close(fig)
-    fig, axs = plt.subplots(2, 4, figsize=(21, 10.5))
-    for ax in axs.ravel():
-        ax.axis("off")
+    fig, axs = plt.subplots(2, 3, figsize=(17, 11))
     for (name, fn), ax in zip(singles, axs.ravel()):
-        ax.axis("on")
         fn(ax, fig)
     fig.suptitle(text.split("\n")[1], fontsize=9)
     fig.tight_layout(); fig.savefig(os.path.join(d, "overview.png"), dpi=130); plt.close(fig)
@@ -538,21 +549,18 @@ def save_example(i, root, free, start, goal, ours, cheb, euc, h_mean, h_std, tex
 
 def save_scatter(rows, out_dir, metric):
     os.makedirs(out_dir, exist_ok=True)
-    a = {k: np.array([r[k] for r in rows], dtype=float) for k in rows[0]}
     key = "exp" if metric == "expanded" else "disc"
-    ours = a[f"ours_{key}"]
-    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-    for ax, kind in zip(axs, ("cheb", "euc")):
-        x = a[f"{kind}_{key}"]
-        lim = max(x.max(), ours.max()) * 1.05
-        ax.scatter(x, ours, s=14, alpha=0.6)
-        ax.plot([0, lim], [0, lim], "r--", lw=1, label="y = x")
-        ax.set_xlim(0, lim); ax.set_ylim(0, lim); ax.set_aspect("equal")
-        ax.set_xlabel(f"nodes {metric} by plain A* ({'Chebyshev' if kind == 'cheb' else 'Euclidean'})")
-        ax.set_ylabel(f"nodes {metric} by stochastic CNN A*")
-        ax.set_title(f"{'Chebyshev' if kind == 'cheb' else 'Euclidean'}: ours fewer on {(ours < x).mean() * 100:.1f}% "
-                     f"of maps, mean ratio {np.mean(ours / x):.2f}", fontsize=9)
-        ax.legend(); ax.grid(alpha=0.3)
+    x = np.array([r[f"astar_{key}"] for r in rows], dtype=float)
+    y = np.array([r[f"ours_{key}"] for r in rows], dtype=float)
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    lim = max(x.max(), y.max()) * 1.05
+    ax.scatter(x, y, s=14, alpha=0.6)
+    ax.plot([0, lim], [0, lim], "r--", lw=1, label="y = x")
+    ax.set_xlim(0, lim); ax.set_ylim(0, lim); ax.set_aspect("equal")
+    ax.set_xlabel(f"nodes {metric} by A* with CNN mean h")
+    ax.set_ylabel(f"nodes {metric} by stochastic CNN A*")
+    ax.set_title(f"stochastic fewer on {(y < x).mean() * 100:.1f}% of maps, mean ratio {np.mean(y / x):.2f}", fontsize=9)
+    ax.legend(); ax.grid(alpha=0.3)
     fig.tight_layout(); fig.savefig(os.path.join(out_dir, "scatter_nodes.png"), dpi=140); plt.close(fig)
 
 
@@ -623,6 +631,8 @@ def main():
     ap.add_argument("--count-metric", choices=["expanded", "discovered"], default="expanded",
                     help="what 'nodes opened' means in the scatter plot / ratios")
     ap.add_argument("--max-expansions", type=int, default=0)
+    ap.add_argument("--astar-reopen", action="store_true",
+                    help="normal A* (CNN mean h) may re-open closed nodes reached by a cheaper route (default: classic closed list)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -646,24 +656,28 @@ def main():
     rows, reports = [], []
     for i in range(n):
         free, start, goal, h_mean, h_std, cost, t_cnn, phi = prepare_map(i, data, nets, phi_model, args, return_phi=True)
-        cheb = plain_astar(free, start, goal, "chebyshev")
-        euc = plain_astar(free, start, goal, "euclidean")
-        opt_len = int(data["lengths"][i]) if "lengths" in data else cheb.path_len
+        base = astar(free, start, goal, h_mean, cost, "A* (CNN mean h)", args.astar_reopen)       # normal A*, same h
+        dij = astar(free, start, goal, np.zeros(free.shape), cost, "Dijkstra (h=0)")             # reference only
+        opt_len = int(data["lengths"][i]) if "lengths" in data else dij.path_len
+        opt_cost = path_cost(dij.path, cost) if dij.found else float("nan")
         ref_std = ref_fixed if ref_fixed else max(float(h_std[free > 0].mean()), 1e-9)
 
         rng = np.random.default_rng(args.seed + i)
         ours = stochastic_astar(free, start, goal, h_mean, h_std, cost, args.c_b, ref_std, args.rank_power, args.temp,
                                 args.k_mode, rng, args.max_expansions or None)
-        rows.append({"index": i, "opt_len": opt_len, "ours_found": int(ours.found),
-                     "ours_exp": ours.n_expanded, "ours_unique": ours.n_unique, "ours_reopened": ours.reopened,
-                     "ours_disc": ours.discovered, "ours_len": ours.path_len,
-                     "ours_ms": ours.time * 1e3, "cheb_exp": cheb.n_expanded, "cheb_disc": cheb.discovered,
-                     "cheb_len": cheb.path_len, "cheb_ms": cheb.time * 1e3, "euc_exp": euc.n_expanded,
-                     "euc_disc": euc.discovered, "euc_len": euc.path_len, "euc_ms": euc.time * 1e3,
+        nan = float("nan")
+        rows.append({"index": i, "opt_len": opt_len, "opt_cost": opt_cost,
+                     "ours_found": int(ours.found), "ours_exp": ours.n_expanded, "ours_unique": ours.n_unique,
+                     "ours_reopened": ours.reopened, "ours_disc": ours.discovered, "ours_len": ours.path_len,
+                     "ours_cost": path_cost(ours.path, cost) if ours.found else nan, "ours_ms": ours.time * 1e3,
+                     "astar_found": int(base.found), "astar_exp": base.n_expanded, "astar_reopened": base.reopened,
+                     "astar_disc": base.discovered, "astar_len": base.path_len,
+                     "astar_cost": path_cost(base.path, cost) if base.found else nan, "astar_ms": base.time * 1e3,
+                     "dij_exp": dij.n_expanded, "dij_disc": dij.discovered, "dij_ms": dij.time * 1e3,
                      "cnn_ms": t_cnn * 1e3})
         if i < args.n_examples:
-            text = describe(i, data, free, start, goal, ours, cheb, euc, h_mean, h_std, ref_std, t_cnn, opt_len,
-                            len(nets), args.count_metric)
+            text = describe(i, free, start, goal, ours, base, dij, h_mean, h_std, ref_std, t_cnn, opt_len, opt_cost,
+                            len(nets), args.count_metric, cost)
             print(text + "\n")
             reports.append(text)
             if phi_model:
@@ -672,23 +686,33 @@ def main():
             else:
                 phi_title = (f"no guidance map: constant Phi = {args.phi_const:g}\n(fed to 'full'-mode nets; "
                              f"g uses cost 1)")
-            save_example(i, ex_dir, free, start, goal, ours, cheb, euc, h_mean, h_std, text, phi, phi_title)
+            save_example(i, ex_dir, free, start, goal, ours, base, h_mean, h_std, text, phi, phi_title)
 
     # ---- aggregate ---------------------------------------------------------------------------------------------
     key = "exp" if args.count_metric == "expanded" else "disc"
     arr = {k: np.array([r[k] for r in rows], dtype=float) for k in rows[0]}
-    ok = arr["ours_found"] > 0
-    agg = [f"=== aggregate over {n} maps ({args.count_metric} nodes; k-mode {args.k_mode}, rank-power {args.rank_power}, "
-           f"temp {args.temp}) ===",
-           f"stochastic search found the goal on {ok.sum()}/{n} maps; mean re-openings per map {arr['ours_reopened'].mean():.1f}",
-           f"mean nodes: ours {arr['ours_' + key].mean():.1f}, A*(Chebyshev) {arr['cheb_' + key].mean():.1f}, "
-           f"A*(Euclidean) {arr['euc_' + key].mean():.1f}",
-           f"ours uses fewer nodes than A*(Chebyshev) on {(arr['ours_' + key] < arr['cheb_' + key]).mean() * 100:.1f}% "
-           f"and than A*(Euclidean) on {(arr['ours_' + key] < arr['euc_' + key]).mean() * 100:.1f}% of the maps",
-           f"mean path/optimal: ours {np.mean(arr['ours_len'][ok] / arr['opt_len'][ok]) if ok.any() else float('nan'):.3f}, "
-           f"Chebyshev {np.mean(arr['cheb_len'] / arr['opt_len']):.3f}, Euclidean {np.mean(arr['euc_len'] / arr['opt_len']):.3f}",
-           f"mean search time (ms): ours {arr['ours_ms'].mean():.2f} (+ CNN {arr['cnn_ms'].mean():.1f}), "
-           f"Chebyshev {arr['cheb_ms'].mean():.2f}, Euclidean {arr['euc_ms'].mean():.2f}"]
+    ok_o, ok_a = arr["ours_found"] > 0, arr["astar_found"] > 0
+    both = ok_o & ok_a
+    ratio_o = arr["ours_cost"] / arr["opt_cost"]
+    ratio_a = arr["astar_cost"] / arr["opt_cost"]
+    agg = [f"=== aggregate over {n} maps ({args.count_metric} nodes; g-mode {args.g_mode}, h-scale {args.h_scale}, "
+           f"k-mode {args.k_mode}, rank-power {args.rank_power}, c-b {args.c_b}, temp {args.temp}) ===",
+           f"goal found: stochastic {ok_o.sum()}/{n}, A* (CNN mean h) {ok_a.sum()}/{n}; "
+           f"mean re-openings per map: stochastic {arr['ours_reopened'].mean():.1f}, A* {arr['astar_reopened'].mean():.1f}",
+           f"mean nodes: stochastic CNN A* {arr['ours_' + key].mean():.1f}, A* (CNN mean h) {arr['astar_' + key].mean():.1f}, "
+           f"Dijkstra (h=0) {arr['dij_' + key].mean():.1f}",
+           f"stochastic uses fewer nodes than A* (CNN mean h) on {(arr['ours_' + key] < arr['astar_' + key]).mean() * 100:.1f}% "
+           f"of the maps (mean ratio stochastic/A* {np.mean(arr['ours_' + key] / arr['astar_' + key]):.2f}); "
+           f"A* (CNN mean h) saves {(1 - arr['astar_' + key].mean() / arr['dij_' + key].mean()) * 100:.1f}% of the nodes vs Dijkstra",
+           f"mean path cost / optimal cost C*: stochastic {np.nanmean(ratio_o[ok_o]) if ok_o.any() else float('nan'):.3f}, "
+           f"A* (CNN mean h) {np.nanmean(ratio_a[ok_a]) if ok_a.any() else float('nan'):.3f}; "
+           f"optimal (cost within 0.1% of C*): stochastic {np.mean(ratio_o[ok_o] <= 1.001) * 100 if ok_o.any() else float('nan'):.1f}%, "
+           f"A* {np.mean(ratio_a[ok_a] <= 1.001) * 100 if ok_a.any() else float('nan'):.1f}%",
+           f"mean path cells: stochastic {arr['ours_len'][ok_o].mean() if ok_o.any() else float('nan'):.1f}, "
+           f"A* (CNN mean h) {arr['astar_len'][ok_a].mean() if ok_a.any() else float('nan'):.1f}, "
+           f"shortest {arr['opt_len'].mean():.1f}",
+           f"mean search time (ms): stochastic {arr['ours_ms'].mean():.2f}, A* (CNN mean h) {arr['astar_ms'].mean():.2f}, "
+           f"Dijkstra {arr['dij_ms'].mean():.2f} (+ CNN inference {arr['cnn_ms'].mean():.1f})"]
     print("\n".join(agg))
     save_scatter(rows, os.path.join(args.out_dir, "scatter"), args.count_metric)
     with open(os.path.join(tab_dir, "summary.csv"), "w", newline="") as f:
